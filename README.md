@@ -25,13 +25,15 @@ No file formats changed. The models, KV cache types and prompt cache are the sam
 
 ## Measured results (one machine, your numbers will differ)
 
-RX 7900 XTX at its 303 W power cap, Mesa RADV, ctx 175,000, MTP draft depth 3. Compared with the unmodified llama.cpp build of the same upstream commit and the same flags:
+RX 7900 XTX at its 303 W power cap, Mesa RADV, ctx 175,000, MTP draft depth 3, temperature 1.0. Compared with the unmodified llama.cpp build of the same upstream commit and the same flags. Each cell is this fork / the original; ranges are the spread over two runs.
 
-| context depth | prefill, this fork | prefill, original | time per MTP step, this fork | original |
+| context depth | prefill (t/s) | decode, prose (t/s) | decode, code (t/s) | time per MTP step |
 |---|---|---|---|---|
-| 8k | 867 t/s | 806 t/s | 33.5 ms | 37.2 ms |
-| 32k | 835 t/s | 682 t/s | 34.7 ms | 43.7 ms |
-| 80k | 710 t/s | 495 t/s | 37.9 ms | 57.7 ms |
+| 8k | 838-885 / 806 | 71.5-77.5 / 59 | 73.6-82.5 / 62 | 33.5 / 37.2 ms |
+| 32k | 832-837 / 682 | 64.6-74.9 / 47 | 66.8-68.7 / 46 | 34.7 / 43.7 ms |
+| 80k | 709-711 / 495 | 58.4 / 36 | 72.7 / 36 | 37.9 / 57.7 ms |
+
+Decode speed depends on how many draft tokens are accepted, which varies from run to run at temperature 1.0, so time per MTP step is the steadier comparison. The decode gain comes from both a shorter step and more accepted draft tokens per step (probabilistic acceptance, about 2.4-2.6 instead of about 2.1-2.3).
 
 **Accuracy** was compared token by token against the original build (KL divergence and top-1 agreement against a CPU reference with exact attention, about 12,000 to 16,000 tokens per test). Everything except the new attention kernels gave bit-identical results. The attention kernels were within statistical noise of the original on the prompt and MTP-verify paths, at shallow and 8k-key depths. These are my measurements on one machine, not a guarantee.
 
