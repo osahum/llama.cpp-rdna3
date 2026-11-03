@@ -781,6 +781,28 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
             return p_raw(k)*p_norm;
         };
 
+        // llama-rdna: LLAMA_SPEC_LOG=<file> appends one JSON line per verify position with the target's candidate
+        // distribution (after its sampler chain, grammar-masked if any) and the draft's distribution, for offline
+        // simulation of acceptance schemes (chains, trees, depths). Measurement aid only.
+        {
+            static FILE * spec_log = [] () -> FILE * { const char * f = getenv("LLAMA_SPEC_LOG"); return f ? fopen(f, "a") : nullptr; } ();
+            if (spec_log) {
+                fprintf(spec_log, "{\"i\":%zu,\"n\":%zu,\"draft\":%d,\"p\":[", i, draft.size(), (int) draft[i]);
+                size_t n_out = 0;
+                for (size_t k = 0; k < cur_p->size && n_out < 32; ++k) {
+                    const float pk = p_of(k);
+                    if (pk <= 0.0f) continue;
+                    fprintf(spec_log, "%s[%d,%.6g]", n_out ? "," : "", (int) cur_p->data[k].id, pk);
+                    ++n_out;
+                }
+                fprintf(spec_log, "],\"q\":[");
+                for (size_t k = 0; k < q.size(); ++k) {
+                    fprintf(spec_log, "%s[%d,%.6g]", k ? "," : "", (int) q[k].id, q[k].p);
+                }
+                fprintf(spec_log, "]}\n");
+                fflush(spec_log);
+            }
+        }
         // q_x is never 0 for a token the draft produced, but guard the divide
         const float q_x = prob_of(q.data(), q.size(), draft[i]);
 

@@ -624,6 +624,8 @@ enum rms_norm_mode {
     RMS_NORM_MUL_ROPE,
     RMS_NORM_MUL_ROPE_VIEW_SET_ROWS,
     RMS_NORM_VIEW_SET_ROWS,
+    RMS_NORM_SCALE,
+    RMS_NORM_MUL_MUL,
     RMS_NORM_COUNT,
 };
 
@@ -789,6 +791,10 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
+    // llama-rdna: per-128 activation scale for the requantized K-quant GEMM; mmq_req[type] marks the types whose
+    // pipeline_dequant_mul_mat_mat_q8_1 was built from mul_mmq_cm1.comp with CM1_REQ and so needs it
+    vk_pipeline pipeline_quantize_q8_1_x4_g128;
+    bool mmq_req[GGML_TYPE_COUNT] {};
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
@@ -850,8 +856,11 @@ struct vk_device_struct {
     vk_pipeline pipeline_group_norm_f32;
     std::array<vk_pipeline, 3> pipeline_rms_norm_f32;
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_f32;
+    std::array<vk_pipeline, 3> pipeline_rms_norm_mul_q8_f32;   // llama-rdna: RMS_NORM + MUL that also emits q8_1 activations
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_add_f32;
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_add_mul_f32;
+    std::array<vk_pipeline, 3> pipeline_rms_norm_mul_mul_f32;   // llama-rdna: rms_norm(x) * w * e (GDN output gate)
+    std::array<vk_pipeline, 8> pipeline_mul_mat_vec_q4k_dualglu;  // llama-rdna: gate/up q4_K mat-vec + SwiGLU, 1-8 columns
     vk_pipeline pipeline_rms_norm_mul_add_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_add_mul_partials_f32;
     vk_pipeline pipeline_rms_norm_set_rows_f32_f32;
@@ -992,6 +1001,13 @@ struct vk_device_struct {
     bool fa_sparse_compact_use_subgroups;
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
+    vk_pipeline pipeline_flash_attn_dec[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_flash_attn_dec_cm[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_flash_attn_dec_cm32[GGML_TYPE_COUNT];   // 2 row tiles (<= 32 rows), less shared memory and work
+    vk_pipeline pipeline_flash_attn_pf[GGML_TYPE_COUNT];         // llama-rdna: prefill, wave32, Q in registers (flash_attn_pf.comp)
+    vk_pipeline pipeline_flash_attn_dec_w[3];                    // llama-rdna: decode, wave32, q4_0, by 16-row query tiles (flash_attn_dec_w.comp)
+    vk_pipeline pipeline_flash_attn_dec_w_pf[3];                 // llama-rdna: the same shader in prompt mode (PF = 1)
+    vk_pipeline pipeline_flash_attn_dec_cmq[GGML_TYPE_COUNT];    // 32-row variant with Q in registers (28 KB shared), opt-in via GGML_VK_FA_DEC_PATH=cmq // llama-rdna: flash_attn_dec.comp per K/V type
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, std::pair<vk_pipeline, vk_pipeline>> pipeline_xe_fa_decode_dual_phases;
     vk_pipeline pipeline_count_experts;
 
@@ -1284,7 +1300,12 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
+    // GATED_DELTA_NET writes its state snapshots straight into the recurrent cache (the following CPY is elided)
+    bool fused_gdn_cache {};
+    bool fused_mmv_dual_glu {};   // llama-rdna: MUL_MAT (gate), MUL_MAT (up), GLU in one mat-vec dispatch
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
+    // RMS_NORM_MUL whose output feeds q8_1 mat-vecs: the norm writes the quantized activations into prealloc_y
+    bool fused_rms_norm_q8 {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;

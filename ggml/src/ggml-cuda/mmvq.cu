@@ -507,6 +507,12 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         return 1;
     }
     if (table_id == MMVQ_PARAMETERS_RDNA3_0) {
+#ifdef GGML_RDNA3_MMVQ_NWARPS
+        // llama-rdna tuning knob (see ggml-hip/CMakeLists.txt): warps per block for the multi-column GEMV
+        if (ncols_dst > 1) {
+            return GGML_RDNA3_MMVQ_NWARPS;
+        }
+#endif
         // RDNA3 (W7900): stricter whitelist than RDNA4.
         // Q2_K / Q5_K / IQ4_XS regress in full quant sweeps.
         if (ncols_dst == 1) {
@@ -593,6 +599,12 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+#ifdef GGML_RDNA3_MMVQ_ROWS
+    // llama-rdna tuning knob: rows per block for the multi-column GEMV on RDNA3
+    if (table_id == MMVQ_PARAMETERS_RDNA3_0 && ncols_dst > 1) {
+        return GGML_RDNA3_MMVQ_ROWS;
+    }
+#endif
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:

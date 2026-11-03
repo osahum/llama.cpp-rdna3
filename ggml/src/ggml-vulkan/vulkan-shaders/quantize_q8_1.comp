@@ -65,6 +65,18 @@ void quantize(const uint wgid) {
 #ifndef USE_SUBGROUPS
     shmem[tid] = thread_max;
     barrier();
+#ifdef QBLOCK_X4_G128
+    // llama-rdna: one scale for the whole x4 block (128 values, 32 threads), for the requantized K-quant GEMM
+    // (mul_mmq_cm1.comp CM1_REQ); the per-32 slots keep their layout and all carry this scale
+    [[unroll]] for (uint s = 16; s > 0; s >>= 1) {
+        if ((tid % 32) < s) {
+            shmem[tid] = max(shmem[tid], shmem[tid + s]);
+        }
+        barrier();
+    }
+
+    const float amax = shmem[(tid / 32) * 32];
+#else
     [[unroll]] for (uint s = 4; s > 0; s >>= 1) {
         if (iqs < s) {
             shmem[tid] = max(shmem[tid], shmem[tid + s]);
@@ -73,8 +85,13 @@ void quantize(const uint wgid) {
     }
 
     const float amax = shmem[block_in_wg * 8];
+#endif
+#else
+#ifdef QBLOCK_X4_G128
+    const float amax = subgroupClusteredMax(thread_max, 32);
 #else
     const float amax = subgroupClusteredMax(thread_max, 8);
+#endif
 #endif
 
     const float d = amax / 127.0;

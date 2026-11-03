@@ -8913,6 +8913,13 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
 
+    // llama-rdna: GGML_CPU_FA_EXACT=1 computes K.Q from the f32 query and the exactly dequantized key row in double
+    // precision, instead of quantizing the query to the K type's vec_dot type (q8_0 for a q4_0 cache). A measurement aid:
+    // the reference for comparing GPU attention paths whose only difference is rounding.
+    static const bool fa_exact = getenv("GGML_CPU_FA_EXACT") != nullptr;
+    ggml_to_float_t   const k_to_float     = ggml_get_type_traits(k->type)->to_float;
+    const bool exact_kq = fa_exact && (k->type == GGML_TYPE_F32 || k_to_float != nullptr);
+
     int ith = params->ith;
 
     for (int ir = ir0; ir < ir1; ++ir) {
@@ -8949,7 +8956,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const int iv2 = iq2 / rv2;
 
         const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
-        q_to_vec_dot(pq, Q_q, DK);
+        if (!exact_kq) {
+            q_to_vec_dot(pq, Q_q, DK);
+        }
 
         // online softmax / attention
         // loop over n_kv and n_head_kv
@@ -8964,7 +8973,22 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             float s; // KQ value
 
             const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
-            kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+            if (exact_kq) {
+                // the Q_q scratch (DK floats) holds the dequantized key row
+                float * K32 = (float *) Q_q;
+                if (k->type == GGML_TYPE_F32) {
+                    memcpy(K32, k_data, DK*sizeof(float));
+                } else {
+                    k_to_float(k_data, K32, DK);
+                }
+                double acc = 0.0;
+                for (int64_t d = 0; d < DK; ++d) {
+                    acc += (double) pq[d] * (double) K32[d];
+                }
+                s = (float) acc;
+            } else {
+                kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+            }
 
             s = s*scale; // scale KQ value
 

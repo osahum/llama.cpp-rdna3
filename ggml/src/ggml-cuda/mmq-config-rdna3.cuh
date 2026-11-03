@@ -119,8 +119,16 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_Q4_K, 128, 1,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
     CASE(GGML_TYPE_Q4_K, 128, 1,  64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
     CASE(GGML_TYPE_Q4_K, 128, 1,  64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
-    CASE(GGML_TYPE_Q4_K, 128, 1,  64,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
-    CASE(GGML_TYPE_Q4_K, 128, 1,  64, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
+#if defined(GGML_RDNA3_MMQ_NTHREADS) && defined(GGML_RDNA3_MMQ_OCC) && defined(GGML_RDNA3_MMQ_I)
+    // llama-rdna sweep knobs (ggml-hip/CMakeLists.txt): tile config for the large-batch K-quant GEMMs
+    CASE(GGML_TYPE_Q4_K, GGML_RDNA3_MMQ_NTHREADS, GGML_RDNA3_MMQ_OCC, GGML_RDNA3_MMQ_I,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_Q4_K, GGML_RDNA3_MMQ_NTHREADS, GGML_RDNA3_MMQ_OCC, GGML_RDNA3_MMQ_I, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
+#else
+    // llama-rdna (probe-8, RX 7900 XTX, measured): 128 threads x I=128 (32 rows per wave) runs this model's Q4_K GEMMs at
+    // 89-98 TFLOPS against 65 for the (128, 1, 64) tile, Q6_K at 72 against 40; occupancy 1 and 2 were within noise.
+    CASE(GGML_TYPE_Q4_K, 128, 2, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_Q4_K, 128, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
+#endif
 
     CASE(GGML_TYPE_Q5_K, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, true);
     CASE(GGML_TYPE_Q5_K, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, true);
@@ -131,8 +139,16 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_Q5_K, 128, 1,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
     CASE(GGML_TYPE_Q5_K, 128, 1,  64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
     CASE(GGML_TYPE_Q5_K, 128, 4,  64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
-    CASE(GGML_TYPE_Q5_K, 128, 4,  64,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
-    CASE(GGML_TYPE_Q5_K, 128, 4,  64, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
+#if defined(GGML_RDNA3_MMQ_NTHREADS) && defined(GGML_RDNA3_MMQ_OCC) && defined(GGML_RDNA3_MMQ_I)
+    // llama-rdna sweep knobs (ggml-hip/CMakeLists.txt): tile config for the large-batch K-quant GEMMs
+    CASE(GGML_TYPE_Q5_K, GGML_RDNA3_MMQ_NTHREADS, GGML_RDNA3_MMQ_OCC, GGML_RDNA3_MMQ_I,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_Q5_K, GGML_RDNA3_MMQ_NTHREADS, GGML_RDNA3_MMQ_OCC, GGML_RDNA3_MMQ_I, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
+#else
+    // llama-rdna (probe-8, RX 7900 XTX, measured): 128 threads x I=128 (32 rows per wave) runs this model's Q4_K GEMMs at
+    // 89-98 TFLOPS against 65 for the (128, 1, 64) tile, Q6_K at 72 against 40; occupancy 1 and 2 were within noise.
+    CASE(GGML_TYPE_Q5_K, 128, 2, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_Q5_K, 128, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
+#endif
 
     CASE(GGML_TYPE_Q6_K, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, true);
     CASE(GGML_TYPE_Q6_K, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, true);
@@ -143,8 +159,16 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_Q6_K, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
     CASE(GGML_TYPE_Q6_K, 128, 1,  64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
     CASE(GGML_TYPE_Q6_K, 128, 1,  64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
-    CASE(GGML_TYPE_Q6_K, 128, 1,  64,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
-    CASE(GGML_TYPE_Q6_K, 128, 1,  64, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
+#if defined(GGML_RDNA3_MMQ_NTHREADS) && defined(GGML_RDNA3_MMQ_OCC) && defined(GGML_RDNA3_MMQ_I)
+    // llama-rdna sweep knobs (ggml-hip/CMakeLists.txt): tile config for the large-batch K-quant GEMMs
+    CASE(GGML_TYPE_Q6_K, GGML_RDNA3_MMQ_NTHREADS, GGML_RDNA3_MMQ_OCC, GGML_RDNA3_MMQ_I,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_Q6_K, GGML_RDNA3_MMQ_NTHREADS, GGML_RDNA3_MMQ_OCC, GGML_RDNA3_MMQ_I, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
+#else
+    // llama-rdna (probe-8, RX 7900 XTX, measured): 128 threads x I=128 (32 rows per wave) runs this model's Q4_K GEMMs at
+    // 89-98 TFLOPS against 65 for the (128, 1, 64) tile, Q6_K at 72 against 40; occupancy 1 and 2 were within noise.
+    CASE(GGML_TYPE_Q6_K, 128, 2, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_Q6_K, 128, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
+#endif
 
 // ---------------------------------------------------------------------------------------------
 

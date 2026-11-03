@@ -1,0 +1,488 @@
+#version 450
+// llama-rdna: cooperative-matrix decode / speculative-verify attention, variant with Q held in matrix fragments in
+// registers (32 A-fragments per subgroup) instead of shared memory, for up to 32 rows (<= 5 tokens x gqa 6). Shared
+// memory drops from 44 KB to 28 KB so two workgroups fit per CU. Otherwise identical to flash_attn_dec_cm.comp
+// (KHR_cooperative_matrix 16x16x16, f16 in, f32 accumulate, wave64).
+//
+// One workgroup = (kv head g, span of 64-key tiles). Its rows are all gqa query heads of all tokens (R = n_tok*gqa
+// <= 48 = 3 row tiles of 16), so every K/V byte is read once per step. Four subgroups: for QK each owns 16 keys of
+// the 64-key tile and computes S[48 x 16] = Q . K^T with K dequantized 64 dims at a time into a private 4.6 KB
+// shared region; the softmax pass is scalar over S in shared memory and writes P as f16; for PV each subgroup owns
+// 64 of the 256 output dims and accumulates O[48 x 64] += P[48 x 64] . V[64 x 64] in 12 named matrix accumulators
+// that stay in registers. Rows are rescaled lazily: a row's running max only moves when a tile exceeds it by more
+// than 2^THRESH, so exp2 terms stay below 2^THRESH and the accumulator round trip through shared memory is rare.
+// K, V and mask values for the next tile are fetched into registers while the current tile is computed.
+// Each span writes one split-K partial (O unnormalized, L, M in natural log) in the layout consumed by
+// flash_attn_split_k_reduce.comp. Structure after hipfire's attention_verify_wmma (Apache-2.0), see NOTICE.
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_cooperative_matrix : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint KV_TYPE = 2;   // ggml_type: 1 = f16, 2 = q4_0, 8 = q8_0
+
+#define NRT 2               // this variant: 2 row tiles of 16 = up to 32 rows
+#define D 256
+#define BC 64
+#define MAX_ROWS (16 * NRT)
+#define THRESH 8.0
+#define LOG2E 1.4426950408889634
+#define LN2 0.6931471805599453
+#define NEG_INF uintBitsToFloat(0xff800000u)
+
+// shared layouts, in units of the array element (f16vec4 = 4 halfs, vec4 = 4 floats)
+#define QS_STRIDE 66        // 64 vec4 of dims + 2 pad
+#define KV_STRIDE 18        // 16 vec4 (64 dims) + 2 pad, per key
+#define KV_SUB 288          // 16 keys * KV_STRIDE, per subgroup
+#define SS_STRIDE 17        // 16 vec4 (64 keys) + 1 pad, per row
+#define PS_STRIDE 18        // 16 vec4 (64 keys) + 2 pad, per row
+#define OS_STRIDE 5         // 4 vec4 (16 dims) + 1 pad, per row
+#define OS_SUB 80           // 16 rows * OS_STRIDE, per subgroup
+
+#define ACC  coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define MATA coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MATB coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+
+struct dec_blk_q4_0 { float16_t d; uint16_t qs[8]; };
+struct dec_blk_q8_0 { float16_t d; int16_t qs[16]; };
+
+layout (binding = 0) readonly buffer QB   { vec4 data_q4[]; };
+layout (binding = 1) readonly buffer KB40 { dec_blk_q4_0 data[]; } k_q4_0;
+layout (binding = 1) readonly buffer KB80 { dec_blk_q8_0 data[]; } k_q8_0;
+layout (binding = 1) readonly buffer KBF  { f16vec4 data[]; } k_f16;
+layout (binding = 2) readonly buffer VB40 { dec_blk_q4_0 data[]; } v_q4_0;
+layout (binding = 2) readonly buffer VB80 { dec_blk_q8_0 data[]; } v_q8_0;
+layout (binding = 2) readonly buffer VBF  { f16vec4 data[]; } v_f16;
+layout (binding = 3) readonly buffer MB4  { uvec4 data_m4[]; };   // mask as 8 packed halfs per element
+layout (binding = 4) writeonly buffer OB  { float data_o[]; };
+
+layout (push_constant) uniform parameter {
+    uint n_tok; uint n_head; uint gqa; uint n_kv; uint n_spans;
+    uint q_tok_stride; uint q_head_stride;   // floats
+    uint k_row_stride; uint k_head_stride;   // blocks (quant) or f16vec4 (f16)
+    uint v_row_stride; uint v_head_stride;
+    uint m_tok_stride;                       // halfs, multiple of 8
+    float scale;
+} p;
+
+shared f16vec4 KVs[4 * KV_SUB];            //  9,216 B  K chunk (16 keys x 64 dims) or V chunk (16 keys x 64 dims), per subgroup;
+                                           //           also the staging area for one 16-row tile of Q at the start (16 x QS_STRIDE = 1,056 vec4)
+shared vec4    Ss[MAX_ROWS * SS_STRIDE];   // 13,056 B  scores, f32
+shared f16vec4 Ps[MAX_ROWS * PS_STRIDE];   //  6,912 B  probabilities, f16
+shared vec4    Osh[4 * OS_SUB];            //  5,120 B  one 16x16 accumulator tile per subgroup, for rescale and output
+shared float   alpha_sh[MAX_ROWS];
+shared uint    any_upd[2];
+
+// ---- raw block staging: one 32-element block of K or V held in registers ----
+struct raw_blk { float16_t d; uint16_t q[16]; f16vec4 h[8]; };   // q4_0 uses q[0..7], q8_0 q[0..15] (bit patterns), f16 uses h
+
+raw_blk load_blk_k(const uint idx, const bool valid) {
+    raw_blk r;
+    r.d = float16_t(0.0);
+    [[unroll]] for (uint i = 0; i < 16; ++i) { r.q[i] = uint16_t(0); }
+    [[unroll]] for (uint i = 0; i < 8; ++i) { r.h[i] = f16vec4(0.0); }
+    if (!valid) { return r; }
+    if (KV_TYPE == 2) {
+        r.d = k_q4_0.data[idx].d;
+        [[unroll]] for (uint i = 0; i < 8; ++i) { r.q[i] = k_q4_0.data[idx].qs[i]; }
+    } else if (KV_TYPE == 8) {
+        r.d = k_q8_0.data[idx].d;
+        [[unroll]] for (uint i = 0; i < 16; ++i) { r.q[i] = uint16_t(k_q8_0.data[idx].qs[i]); }
+    } else {
+        [[unroll]] for (uint i = 0; i < 8; ++i) { r.h[i] = k_f16.data[idx + i]; }
+    }
+    return r;
+}
+
+raw_blk load_blk_v(const uint idx, const bool valid) {
+    raw_blk r;
+    r.d = float16_t(0.0);
+    [[unroll]] for (uint i = 0; i < 16; ++i) { r.q[i] = uint16_t(0); }
+    [[unroll]] for (uint i = 0; i < 8; ++i) { r.h[i] = f16vec4(0.0); }
+    if (!valid) { return r; }
+    if (KV_TYPE == 2) {
+        r.d = v_q4_0.data[idx].d;
+        [[unroll]] for (uint i = 0; i < 8; ++i) { r.q[i] = v_q4_0.data[idx].qs[i]; }
+    } else if (KV_TYPE == 8) {
+        r.d = v_q8_0.data[idx].d;
+        [[unroll]] for (uint i = 0; i < 16; ++i) { r.q[i] = uint16_t(v_q8_0.data[idx].qs[i]); }
+    } else {
+        [[unroll]] for (uint i = 0; i < 8; ++i) { r.h[i] = v_f16.data[idx + i]; }
+    }
+    return r;
+}
+
+// dequantize one staged block into 8 f16vec4 at KVs[dst ..]
+void store_blk(const raw_blk r, const uint dst) {
+    if (KV_TYPE == 2) {
+        const float d = float(r.d);
+        float v[32];
+        [[unroll]] for (uint i = 0; i < 8; ++i) {
+            const uint u = uint(r.q[i]);
+            v[2*i]      = float(int( u        & 0xFu) - 8);
+            v[2*i + 1]  = float(int((u >>  8) & 0xFu) - 8);
+            v[2*i + 16] = float(int((u >>  4) & 0xFu) - 8);
+            v[2*i + 17] = float(int((u >> 12) & 0xFu) - 8);
+        }
+        [[unroll]] for (uint q = 0; q < 8; ++q) { KVs[dst + q] = f16vec4(d * vec4(v[4*q], v[4*q+1], v[4*q+2], v[4*q+3])); }
+    } else if (KV_TYPE == 8) {
+        const float d = float(r.d);
+        float v[32];
+        [[unroll]] for (uint i = 0; i < 16; ++i) {
+            const int u = int(r.q[i]);   // low byte = value 2i, high byte = value 2i+1, both signed
+            v[2*i]     = float((u << 24) >> 24);
+            v[2*i + 1] = float((u << 16) >> 24);
+        }
+        [[unroll]] for (uint q = 0; q < 8; ++q) { KVs[dst + q] = f16vec4(d * vec4(v[4*q], v[4*q+1], v[4*q+2], v[4*q+3])); }
+    } else {
+        [[unroll]] for (uint q = 0; q < 8; ++q) { KVs[dst + q] = r.h[q]; }
+    }
+}
+
+uint k_blk_index(const uint key, const uint g, const uint blk) {
+    return (KV_TYPE == 1) ? key * p.k_row_stride + g * p.k_head_stride + 8 * blk : key * p.k_row_stride + g * p.k_head_stride + blk;
+}
+uint v_blk_index(const uint key, const uint g, const uint blk) {
+    return (KV_TYPE == 1) ? key * p.v_row_stride + g * p.v_head_stride + 8 * blk : key * p.v_row_stride + g * p.v_head_stride + blk;
+}
+
+// one 16x16 accumulator tile -> Osh (subgroup-private), scaled per row by alpha_sh[row0 + row], -> back
+#define RESCALE_TILE(OT, I) { \
+    coopMatStore(OT, Osh, s * OS_SUB, OS_STRIDE, gl_CooperativeMatrixLayoutRowMajor); \
+    subgroupMemoryBarrierShared(); subgroupBarrier(); \
+    Osh[s * OS_SUB + (lane >> 2) * OS_STRIDE + (lane & 3)] *= alpha_sh[16 * (I) + (lane >> 2)]; \
+    subgroupMemoryBarrierShared(); subgroupBarrier(); \
+    coopMatLoad(OT, Osh, s * OS_SUB, OS_STRIDE, gl_CooperativeMatrixLayoutRowMajor); \
+    subgroupMemoryBarrierShared(); subgroupBarrier(); }
+
+// one 16x16 accumulator tile -> Osh -> the split-K partial of rows 16*I.., dims 64*s + 16*NT ..
+#define STORE_TILE(OT, NT, I) { \
+    coopMatStore(OT, Osh, s * OS_SUB, OS_STRIDE, gl_CooperativeMatrixLayoutRowMajor); \
+    subgroupMemoryBarrierShared(); subgroupBarrier(); \
+    { const uint row = lane >> 2; const uint j = lane & 3; const uint r = 16 * (I) + row; \
+      if (r < R) { \
+        const uint tok  = r / p.gqa; \
+        const uint head = g * p.gqa + r % p.gqa; \
+        const uint o_base = D * p.n_head * (span + n_spans * tok) + D * head + 64 * s + 16 * (NT) + 4 * j; \
+        const vec4 o = Osh[s * OS_SUB + row * OS_STRIDE + j]; \
+        data_o[o_base + 0] = o.x; data_o[o_base + 1] = o.y; data_o[o_base + 2] = o.z; data_o[o_base + 3] = o.w; } } \
+    subgroupMemoryBarrierShared(); subgroupBarrier(); }
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint s    = gl_SubgroupID;             // 0..3
+    const uint lane = gl_SubgroupInvocationID;   // 0..63
+    const uint g    = gl_WorkGroupID.x;          // kv head
+    const uint span = gl_WorkGroupID.y;
+    const uint R    = p.n_tok * p.gqa;
+    const uint n_spans = p.n_spans;
+    const uint total_tiles = (p.n_kv + BC - 1) / BC;
+    const float scale_log2 = p.scale * LOG2E;
+
+    // ---- Q (token-major, then head within the kv group) -> f16 matrix fragments in registers, one 16-row tile at a time
+    //      staged through the K/V area; rows >= R are zero ----
+    MATA Q0_0; MATA Q0_1; MATA Q0_2; MATA Q0_3; MATA Q0_4; MATA Q0_5; MATA Q0_6; MATA Q0_7; MATA Q0_8; MATA Q0_9; MATA Q0_10; MATA Q0_11; MATA Q0_12; MATA Q0_13; MATA Q0_14; MATA Q0_15; MATA Q1_0; MATA Q1_1; MATA Q1_2; MATA Q1_3; MATA Q1_4; MATA Q1_5; MATA Q1_6; MATA Q1_7; MATA Q1_8; MATA Q1_9; MATA Q1_10; MATA Q1_11; MATA Q1_12; MATA Q1_13; MATA Q1_14; MATA Q1_15;
+    [[unroll]] for (uint i = 0; i < 2; ++i) {
+        for (uint idx = tid; idx < 16 * (D / 4); idx += 256) {
+            const uint rr = idx / (D / 4);
+            const uint q  = idx % (D / 4);
+            const uint r  = 16 * i + rr;
+            f16vec4 val = f16vec4(0.0);
+            if (r < R) {
+                const uint tok  = r / p.gqa;
+                const uint head = g * p.gqa + r % p.gqa;
+                val = f16vec4(data_q4[(tok * p.q_tok_stride + head * p.q_head_stride) / 4 + q]);
+            }
+            KVs[rr * QS_STRIDE + q] = val;
+        }
+        barrier();
+        if (i == 0) {
+        coopMatLoad(Q0_0, KVs, 4 * 0, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q0_1, KVs, 4 * 1, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q0_2, KVs, 4 * 2, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q0_3, KVs, 4 * 3, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q0_4, KVs, 4 * 4, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q0_5, KVs, 4 * 5, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q0_6, KVs, 4 * 6, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q0_7, KVs, 4 * 7, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q0_8, KVs, 4 * 8, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q0_9, KVs, 4 * 9, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q0_10, KVs, 4 * 10, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q0_11, KVs, 4 * 11, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q0_12, KVs, 4 * 12, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q0_13, KVs, 4 * 13, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q0_14, KVs, 4 * 14, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q0_15, KVs, 4 * 15, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        } else {
+        coopMatLoad(Q1_0, KVs, 4 * 0, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q1_1, KVs, 4 * 1, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q1_2, KVs, 4 * 2, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q1_3, KVs, 4 * 3, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q1_4, KVs, 4 * 4, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q1_5, KVs, 4 * 5, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q1_6, KVs, 4 * 6, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q1_7, KVs, 4 * 7, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q1_8, KVs, 4 * 8, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q1_9, KVs, 4 * 9, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q1_10, KVs, 4 * 10, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q1_11, KVs, 4 * 11, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q1_12, KVs, 4 * 12, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q1_13, KVs, 4 * 13, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q1_14, KVs, 4 * 14, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(Q1_15, KVs, 4 * 15, QS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();   // before the next tile (or the first K chunk) overwrites the staging area
+    }
+    if (tid == 0) { any_upd[0] = 0u; any_upd[1] = 0u; }
+
+    // ---- softmax lanes: row r = tid / 4 (tid < 192), keys 16*(tid&3) .. +16 of the tile ----
+    const bool sm_lane = tid < 4 * MAX_ROWS;
+    const uint sm_row  = tid >> 2;
+    const uint sm_part = tid & 3;
+    const bool sm_row_ok = sm_row < R;
+    const uint sm_tok  = sm_row_ok ? sm_row / p.gqa : 0u;
+    const uint sm_mbase = (sm_tok * p.m_tok_stride + 16 * sm_part) / 8;   // uvec4 index of this lane's mask, before key0/8
+    float m_run = NEG_INF;
+    float l_run = 0.0;
+
+    // ---- accumulators: O{nt}{i} = rows 16i.., dims 64s + 16nt .. ----
+    ACC O00; ACC O01; ACC O10; ACC O11; ACC O20; ACC O21; ACC O30; ACC O31;
+    O00 = ACC(0.0); O01 = ACC(0.0); O10 = ACC(0.0); O11 = ACC(0.0); O20 = ACC(0.0); O21 = ACC(0.0); O30 = ACC(0.0); O31 = ACC(0.0);
+#if NRT == 3
+    ACC O02; ACC O12; ACC O22; ACC O32;
+    O02 = ACC(0.0); O12 = ACC(0.0); O22 = ACC(0.0); O32 = ACC(0.0);
+#else
+    const uint O02 = 0u, O12 = 0u, O22 = 0u, O32 = 0u;   // unused names referenced by the PV macro arguments
+#endif
+
+    // ---- staging assignment ----
+    // K: subgroup s owns keys 16s..16s+15 of the tile; lane -> key 16s + (lane & 15), blocks b0 = lane >> 4 and b0 + 4.
+    const uint k_key_local = s * 16 + (lane & 15);
+    const uint k_b0 = lane >> 4;
+    // V: subgroup s owns dims 64s..64s+63 (blocks 2s, 2s+1); lane -> key k0 = 16*(lane>>5) + (lane&15) and k0 + 32,
+    //    block 2s + ((lane >> 4) & 1).
+    const uint v_key0 = 16 * (lane >> 5) + (lane & 15);
+    const uint v_blk  = 2 * s + ((lane >> 4) & 1);
+    const uint sbase  = s * KV_SUB;
+
+    raw_blk kraw0, kraw1, vraw0, vraw1;
+    uvec4 mraw0 = uvec4(0), mraw1 = uvec4(0);
+    {
+        const uint key0 = span * BC;
+        const uint kk = key0 + k_key_local;
+        kraw0 = load_blk_k(k_blk_index(min(kk, p.n_kv - 1), g, k_b0),     kk < p.n_kv);
+        kraw1 = load_blk_k(k_blk_index(min(kk, p.n_kv - 1), g, k_b0 + 4), kk < p.n_kv);
+        const uint vk0 = key0 + v_key0;
+        const uint vk1 = vk0 + 32;
+        vraw0 = load_blk_v(v_blk_index(min(vk0, p.n_kv - 1), g, v_blk), vk0 < p.n_kv);
+        vraw1 = load_blk_v(v_blk_index(min(vk1, p.n_kv - 1), g, v_blk), vk1 < p.n_kv);
+        if (sm_lane) { mraw0 = data_m4[sm_mbase + key0 / 8]; mraw1 = data_m4[sm_mbase + key0 / 8 + 1]; }
+    }
+
+    barrier();
+
+    uint parity = 0;
+    for (uint t = span; t < total_tiles; t += n_spans) {
+        const uint key0 = t * BC;
+        const bool has_next = t + n_spans < total_tiles;
+        const uint next_key0 = (t + n_spans) * BC;
+
+        // ================= QK: S[48 x 16 keys of this subgroup] = Q . K^T, 64 dims per chunk =================
+        ACC S0; ACC S1;
+        S0 = ACC(0.0); S1 = ACC(0.0);
+#if NRT == 3
+        ACC S2;
+        S2 = ACC(0.0);
+#endif
+
+        MATB Kt;
+        {   // chunk 0: dims 0..63
+            if ((k_b0 & ~1u) == 0u) { store_blk(kraw0, sbase + (lane & 15) * KV_STRIDE + (k_b0 & 1) * 8); }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            coopMatLoad(Kt, KVs, sbase + 4 * 0, KV_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            S0 = coopMatMulAdd(Q0_0, Kt, S0); S1 = coopMatMulAdd(Q1_0, Kt, S1);
+            coopMatLoad(Kt, KVs, sbase + 4 * 1, KV_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            S0 = coopMatMulAdd(Q0_1, Kt, S0); S1 = coopMatMulAdd(Q1_1, Kt, S1);
+            coopMatLoad(Kt, KVs, sbase + 4 * 2, KV_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            S0 = coopMatMulAdd(Q0_2, Kt, S0); S1 = coopMatMulAdd(Q1_2, Kt, S1);
+            coopMatLoad(Kt, KVs, sbase + 4 * 3, KV_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            S0 = coopMatMulAdd(Q0_3, Kt, S0); S1 = coopMatMulAdd(Q1_3, Kt, S1);
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+        }
+        {   // chunk 1: dims 64..127
+            if ((k_b0 & ~1u) == 2u) { store_blk(kraw0, sbase + (lane & 15) * KV_STRIDE + (k_b0 & 1) * 8); }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            coopMatLoad(Kt, KVs, sbase + 4 * 0, KV_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            S0 = coopMatMulAdd(Q0_4, Kt, S0); S1 = coopMatMulAdd(Q1_4, Kt, S1);
+            coopMatLoad(Kt, KVs, sbase + 4 * 1, KV_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            S0 = coopMatMulAdd(Q0_5, Kt, S0); S1 = coopMatMulAdd(Q1_5, Kt, S1);
+            coopMatLoad(Kt, KVs, sbase + 4 * 2, KV_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            S0 = coopMatMulAdd(Q0_6, Kt, S0); S1 = coopMatMulAdd(Q1_6, Kt, S1);
+            coopMatLoad(Kt, KVs, sbase + 4 * 3, KV_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            S0 = coopMatMulAdd(Q0_7, Kt, S0); S1 = coopMatMulAdd(Q1_7, Kt, S1);
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+        }
+        {   // chunk 2: dims 128..191
+            if ((k_b0 & ~1u) == 0u) { store_blk(kraw1, sbase + (lane & 15) * KV_STRIDE + (k_b0 & 1) * 8); }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            coopMatLoad(Kt, KVs, sbase + 4 * 0, KV_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            S0 = coopMatMulAdd(Q0_8, Kt, S0); S1 = coopMatMulAdd(Q1_8, Kt, S1);
+            coopMatLoad(Kt, KVs, sbase + 4 * 1, KV_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            S0 = coopMatMulAdd(Q0_9, Kt, S0); S1 = coopMatMulAdd(Q1_9, Kt, S1);
+            coopMatLoad(Kt, KVs, sbase + 4 * 2, KV_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            S0 = coopMatMulAdd(Q0_10, Kt, S0); S1 = coopMatMulAdd(Q1_10, Kt, S1);
+            coopMatLoad(Kt, KVs, sbase + 4 * 3, KV_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            S0 = coopMatMulAdd(Q0_11, Kt, S0); S1 = coopMatMulAdd(Q1_11, Kt, S1);
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+        }
+        {   // chunk 3: dims 192..255
+            if ((k_b0 & ~1u) == 2u) { store_blk(kraw1, sbase + (lane & 15) * KV_STRIDE + (k_b0 & 1) * 8); }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            coopMatLoad(Kt, KVs, sbase + 4 * 0, KV_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            S0 = coopMatMulAdd(Q0_12, Kt, S0); S1 = coopMatMulAdd(Q1_12, Kt, S1);
+            coopMatLoad(Kt, KVs, sbase + 4 * 1, KV_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            S0 = coopMatMulAdd(Q0_13, Kt, S0); S1 = coopMatMulAdd(Q1_13, Kt, S1);
+            coopMatLoad(Kt, KVs, sbase + 4 * 2, KV_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            S0 = coopMatMulAdd(Q0_14, Kt, S0); S1 = coopMatMulAdd(Q1_14, Kt, S1);
+            coopMatLoad(Kt, KVs, sbase + 4 * 3, KV_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            S0 = coopMatMulAdd(Q0_15, Kt, S0); S1 = coopMatMulAdd(Q1_15, Kt, S1);
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+        }
+        // prefetch the next tile's K blocks now that the staged ones are consumed
+        if (has_next) {
+            const uint nk = next_key0 + k_key_local;
+            kraw0 = load_blk_k(k_blk_index(min(nk, p.n_kv - 1), g, k_b0),     nk < p.n_kv);
+            kraw1 = load_blk_k(k_blk_index(min(nk, p.n_kv - 1), g, k_b0 + 4), nk < p.n_kv);
+        }
+        coopMatStore(S0, Ss,  0 * SS_STRIDE + 4 * s, SS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(S1, Ss, 16 * SS_STRIDE + 4 * s, SS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+#if NRT == 3
+        coopMatStore(S2, Ss, 32 * SS_STRIDE + 4 * s, SS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+#endif
+        barrier();
+
+        // ================= softmax over the 64 keys of the tile, lazy running max =================
+        if (sm_lane) {
+            const uint kbase = key0 + 16 * sm_part;
+            // scores for this lane's 16 keys, in log2 units, -inf where the key or the row does not exist
+            vec4 sc[4];
+            float mx = NEG_INF;
+            [[unroll]] for (uint j = 0; j < 4; ++j) {
+                const uvec4 wsel = (j < 2) ? mraw0 : mraw1;
+                const uint  w0 = ((j & 1) == 0) ? wsel.x : wsel.z;
+                const uint  w1 = ((j & 1) == 0) ? wsel.y : wsel.w;
+                const vec4  mv = vec4(unpackHalf2x16(w0), unpackHalf2x16(w1));
+                const vec4  v  = Ss[sm_row * SS_STRIDE + 4 * sm_part + j];
+                const uvec4 kk = uvec4(kbase + 4 * j) + uvec4(0, 1, 2, 3);
+                const bvec4 ok = lessThan(kk, uvec4(sm_row_ok ? p.n_kv : 0u));   // row missing -> nothing valid
+                vec4 sv = v * scale_log2 + mv * LOG2E;
+                sv = mix(vec4(NEG_INF), sv, ok);
+                // a masked key (mask = -inf) also lands at -inf through the add; NaN cannot arise here since mv is finite or -inf
+                sc[j] = sv;
+                mx = max(mx, max(max(sv.x, sv.y), max(sv.z, sv.w)));
+            }
+            const float rowmax = subgroupClusteredMax(mx, 4);
+            const bool  upd    = rowmax > m_run + THRESH;   // false while rowmax == -inf
+            const float m_new  = upd ? rowmax : m_run;
+            const float alpha  = upd ? ((m_run == NEG_INF) ? 0.0 : exp2(m_run - m_new)) : 1.0;
+            float psum = 0.0;
+            [[unroll]] for (uint j = 0; j < 4; ++j) {
+                const vec4 pv = (m_new == NEG_INF) ? vec4(0.0) : exp2(sc[j] - m_new);   // exp2(-inf) = 0 for masked keys
+                psum += pv.x + pv.y + pv.z + pv.w;
+                Ps[sm_row * PS_STRIDE + 4 * sm_part + j] = f16vec4(pv);
+            }
+            l_run = l_run * alpha + psum;
+            m_run = m_new;
+            if (sm_part == 0) {
+                alpha_sh[sm_row] = alpha;
+                if (upd) { any_upd[parity] = 1u; }
+            }
+            // prefetch the next tile's mask words
+            if (has_next) { mraw0 = data_m4[sm_mbase + next_key0 / 8]; mraw1 = data_m4[sm_mbase + next_key0 / 8 + 1]; }
+        }
+        if (tid == 0) { any_upd[parity ^ 1u] = 0u; }
+        barrier();
+
+        // ================= rare: rescale the accumulators of rows whose max moved =================
+        if (any_upd[parity] != 0u) {
+            RESCALE_TILE(O00, 0) RESCALE_TILE(O01, 1) RESCALE_TILE(O10, 0) RESCALE_TILE(O11, 1)
+            RESCALE_TILE(O20, 0) RESCALE_TILE(O21, 1) RESCALE_TILE(O30, 0) RESCALE_TILE(O31, 1)
+#if NRT == 3
+            RESCALE_TILE(O02, 2) RESCALE_TILE(O12, 2) RESCALE_TILE(O22, 2) RESCALE_TILE(O32, 2)
+#endif
+        }
+        parity ^= 1u;
+
+        // ================= PV: O[48 x 64 dims of this subgroup] += P . V, 16 keys per chunk =================
+        MATA Pt0; MATA Pt1;
+#if NRT == 3
+        MATA Pt2;
+#endif
+        MATB Vt;
+        for (uint vc = 0; vc < 4; ++vc) {
+            // chunk vc covers keys 16vc..16vc+15: lanes with (lane >> 5) == vc (vc < 2, first block) or vc - 2 (second)
+            const uint want = (vc < 2) ? vc : (vc - 2);
+            if ((lane >> 5) == want) {
+                if (vc < 2) { store_blk(vraw0, sbase + (lane & 15) * KV_STRIDE + ((lane >> 4) & 1) * 8); }
+                else        { store_blk(vraw1, sbase + (lane & 15) * KV_STRIDE + ((lane >> 4) & 1) * 8); }
+            }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            coopMatLoad(Pt0, Ps,  0 * PS_STRIDE + 4 * vc, PS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(Pt1, Ps, 16 * PS_STRIDE + 4 * vc, PS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+#if NRT == 3
+            coopMatLoad(Pt2, Ps, 32 * PS_STRIDE + 4 * vc, PS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+#define PV_TILE2(A2) A2 = coopMatMulAdd(Pt2, Vt, A2);
+#else
+#define PV_TILE2(A2)
+#endif
+#define PV_STEP(NT, A0, A1, A2) \
+            coopMatLoad(Vt, KVs, sbase + 4 * (NT), KV_STRIDE, gl_CooperativeMatrixLayoutRowMajor); \
+            A0 = coopMatMulAdd(Pt0, Vt, A0); A1 = coopMatMulAdd(Pt1, Vt, A1); PV_TILE2(A2)
+            PV_STEP(0, O00, O01, O02) PV_STEP(1, O10, O11, O12) PV_STEP(2, O20, O21, O22) PV_STEP(3, O30, O31, O32)
+#undef PV_STEP
+#undef PV_TILE2
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+        }
+        if (has_next) {
+            const uint nv0 = next_key0 + v_key0;
+            const uint nv1 = nv0 + 32;
+            vraw0 = load_blk_v(v_blk_index(min(nv0, p.n_kv - 1), g, v_blk), nv0 < p.n_kv);
+            vraw1 = load_blk_v(v_blk_index(min(nv1, p.n_kv - 1), g, v_blk), nv1 < p.n_kv);
+        }
+        // Ss / Ps are rewritten only after the next QK phase's workgroup barrier, which every subgroup reaches after
+        // finishing this PV phase, so no barrier is needed here.
+    }
+
+    // ================= partials: O (unnormalized), L and M (natural-log domain) per (span, token, head) =================
+    STORE_TILE(O00, 0, 0) STORE_TILE(O01, 0, 1) STORE_TILE(O10, 1, 0) STORE_TILE(O11, 1, 1)
+    STORE_TILE(O20, 2, 0) STORE_TILE(O21, 2, 1) STORE_TILE(O30, 3, 0) STORE_TILE(O31, 3, 1)
+#if NRT == 3
+    STORE_TILE(O02, 0, 2) STORE_TILE(O12, 1, 2) STORE_TILE(O22, 2, 2) STORE_TILE(O32, 3, 2)
+#endif
+    if (sm_lane) {
+        const float l_tot = subgroupClusteredAdd(l_run, 4);
+        if (sm_part == 0 && sm_row_ok) {
+            const uint head = g * p.gqa + sm_row % p.gqa;
+            const uint lm = D * p.n_head * p.n_tok * n_spans + p.n_head * 2 * (span + n_spans * sm_tok) + head;
+            data_o[lm] = l_tot;
+            data_o[lm + p.n_head] = (m_run == NEG_INF) ? NEG_INF : m_run * LN2;
+        }
+    }
+}

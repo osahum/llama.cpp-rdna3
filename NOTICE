@@ -1,0 +1,24 @@
+llama-rdna
+Copyright notices for code borrowed into this fork.
+
+This fork of llama.cpp (MIT, see LICENSE) contains code derived from hipfire
+(https://github.com/Kaden-Schutt/hipfire, reference commit efa8fbb), licensed
+under the Apache License, Version 2.0. Per-file SPDX headers govern.
+
+  ggml/src/ggml-cuda/fattn-dec-wmma.cu
+    Derived from kernels/src/attention_verify_wmma.gfx1100.hip
+    Copyright (c) 2026 Ben1078
+    SPDX-License-Identifier: Apache-2.0
+
+The Apache License, Version 2.0 is available at
+http://www.apache.org/licenses/LICENSE-2.0 and in licenses/LICENSE-apache-2.0.txt
+if present in this tree.
+
+The Vulkan decode attention shaders ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_dec.comp and
+flash_attn_dec_cm.comp follow the same structure (all GQA rows of a kv head per workgroup, keys split over
+workgroups, dequantization at tile fill, split-K partials) as hipfire's kernels/src/attention_verify_wmma.gfx1100.hip
+(Copyright (c) 2026 Ben1078, Apache-2.0, reference commit efa8fbb). They are new GLSL code; the attribution above applies.
+ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_dec_w.comp follows that kernel more closely (subgroup roles of query tile,
+key half and dim half, Q^T fragments in registers, K and V^T planes filled in alternating phases, S^T exchange between
+the dim halves, register softmax with a lazy rescale); it is new GLSL code for q4_0, and the same attribution applies.
+

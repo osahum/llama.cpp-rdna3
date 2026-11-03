@@ -4,7 +4,142 @@
 //   block_a_load()           — load from global memory into a block_a_prefetch
 //   block_a_to_shmem()       — unpack and write to shared memory
 
-#if defined(DATA_A_Q4_0)
+#if defined(CM1_REQ) && (defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K))
+
+// llama-rdna (CM1_REQ, see mul_mmq_cm1.comp): w = a_j * n - b_j with a_j = d * sc_j, b_j = dmin * m_j is requantized to
+// round(w * 127 / gmax), gmax = max |w| over the four 32-wide sub-blocks of the 128-wide k stage (always one half of a
+// 256-block, since stages and split-k boundaries are 128 / 256 aligned). The stage's row scale gmax / 127 goes to buf_a_d.
+#if defined(DATA_A_Q4_K)
+#define KQ_NMAX 15.0
+#else
+#define KQ_NMAX 31.0
+#endif
+
+struct block_a_prefetch {
+    uint32_t qs0;
+    uint32_t qs1;
+    vec2 ab;        // (d * sc, dmin * m) of this 32-wide sub-block
+    float gmax;     // max |w| over the stage's four sub-blocks
+};
+
+vec2 kq_ab(const uint ib_k, const uint sub) {
+    const uint j = sub & 3u;
+    const uint s_j  = uint(data_a[ib_k].scales[j]);
+    const uint s_j4 = uint(data_a[ib_k].scales[j + 4]);
+    const uint s_j8 = uint(data_a[ib_k].scales[j + 8]);
+    const uint sc_val = (sub < 4) ? (s_j  & 0x3Fu) : ((s_j8 & 0x0Fu) | ((s_j  >> 6) << 4));
+    const uint mn_val = (sub < 4) ? (s_j4 & 0x3Fu) : ((s_j8 >> 4)    | ((s_j4 >> 6) << 4));
+    const vec2 dm = vec2(data_a_packed32[ib_k].dm);
+    return vec2(dm.x * float(sc_val), dm.y * float(mn_val));
+}
+
+block_a_prefetch block_a_load(uint ib, uint loadr) {
+    block_a_prefetch blk;
+    const uint ib_k = ib / 8;
+    const uint sub = ib % 8;
+    const uint qs_base = (sub >> 1) * 8;
+
+    uint32_t raw0 = data_a_packed32[ib_k].qs[qs_base + loadr * 2];
+    uint32_t raw1 = data_a_packed32[ib_k].qs[qs_base + loadr * 2 + 1];
+    if ((sub & 1u) != 0u) {
+        raw0 >>= 4;
+        raw1 >>= 4;
+    }
+    blk.qs0 = raw0 & 0x0F0F0F0F;
+    blk.qs1 = raw1 & 0x0F0F0F0F;
+#if defined(DATA_A_Q5_K)
+    blk.qs0 |= ((data_a_packed32[ib_k].qh[loadr * 2    ] >> sub) & 0x01010101) << 4;
+    blk.qs1 |= ((data_a_packed32[ib_k].qh[loadr * 2 + 1] >> sub) & 0x01010101) << 4;
+#endif
+    blk.ab = kq_ab(ib_k, sub);
+    float g = 0.0;
+    [[unroll]] for (uint jj = 0; jj < 4; ++jj) {
+        const vec2 ab = kq_ab(ib_k, (sub & 4u) + jj);
+        g = max(g, max(abs(ab.y), abs(KQ_NMAX * ab.x - ab.y)));
+    }
+    blk.gmax = g;
+    return blk;
+}
+
+void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bool in_bounds) {
+    const float inv = (in_bounds && blk.gmax > 0.0) ? 127.0 / blk.gmax : 0.0;
+    const vec4 w0 = clamp(round((blk.ab.x * vec4(unpack8(blk.qs0)) - blk.ab.y) * inv), -127.0, 127.0);
+    const vec4 w1 = clamp(round((blk.ab.x * vec4(unpack8(blk.qs1)) - blk.ab.y) * inv), -127.0, 127.0);
+    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2    ] = uint32_t(pack32(i8vec4(w0)));
+    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2 + 1] = uint32_t(pack32(i8vec4(w1)));
+    if (ks == 0 && loadr == 0) {
+        buf_a_d[buf_ib] = in_bounds ? blk.gmax / 127.0 : 0.0;
+    }
+}
+
+#elif defined(CM1_REQ) && defined(DATA_A_Q6_K)
+
+// llama-rdna (CM1_REQ): w = d * sc_h * (q - 32) with sc_h the int8 scale of a 16-value half; requantized to
+// round(sc_h * (q - 32) * 127 / gmax), gmax = 32 * max |sc| over the eight halves of the 128-wide stage, row scale
+// d * gmax / 127.
+struct block_a_prefetch {
+    uint32_t qs0;
+    uint32_t qs1;
+    float sc;       // scale of the 16-value half these 8 values belong to (loadr / 2)
+    float gmax;     // 32 * max |sc| over the stage
+    float d;
+};
+
+block_a_prefetch block_a_load(uint ib, uint loadr) {
+    block_a_prefetch blk;
+    const uint ib_k = ib / 8;
+    const uint sub = ib % 8;
+    const uint g = sub / 4;
+    const uint j = sub % 4;
+
+    const uint ql_u16 = g * 32 + (j & 1) * 16 + loadr * 4;
+    const uint qh_u16 = g * 16 + loadr * 4;
+    const uint qh_shift = j * 2;
+
+    uint32_t ql0 = pack32(u16vec2(data_a_packed16[ib_k].ql[ql_u16    ],
+                                   data_a_packed16[ib_k].ql[ql_u16 + 1]));
+    uint32_t ql1 = pack32(u16vec2(data_a_packed16[ib_k].ql[ql_u16 + 2],
+                                   data_a_packed16[ib_k].ql[ql_u16 + 3]));
+    if (j >= 2) {
+        ql0 = (ql0 >> 4) & 0x0F0F0F0F;
+        ql1 = (ql1 >> 4) & 0x0F0F0F0F;
+    } else {
+        ql0 = ql0 & 0x0F0F0F0F;
+        ql1 = ql1 & 0x0F0F0F0F;
+    }
+
+    uint32_t qh0 = pack32(u16vec2(data_a_packed16[ib_k].qh[qh_u16    ],
+                                   data_a_packed16[ib_k].qh[qh_u16 + 1]));
+    uint32_t qh1 = pack32(u16vec2(data_a_packed16[ib_k].qh[qh_u16 + 2],
+                                   data_a_packed16[ib_k].qh[qh_u16 + 3]));
+
+    blk.qs0 = ql0 | (((qh0 >> qh_shift) & 0x03030303) << 4);
+    blk.qs1 = ql1 | (((qh1 >> qh_shift) & 0x03030303) << 4);
+
+    const ivec2 own = ivec2(unpack8(int32_t(int16_t(data_a_packed16[ib_k].scales[sub]))).xy);
+    blk.sc = float(loadr < 2 ? own.x : own.y);
+    int m = 0;
+    [[unroll]] for (uint jj = 0; jj < 4; ++jj) {
+        const ivec2 s2 = ivec2(unpack8(int32_t(int16_t(data_a_packed16[ib_k].scales[(sub & 4u) + jj]))).xy);
+        m = max(m, max(abs(s2.x), abs(s2.y)));
+    }
+    blk.gmax = 32.0 * float(m);
+    blk.d = float(data_a_packed16[ib_k].d);
+    return blk;
+}
+
+void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bool in_bounds) {
+    const float f = (in_bounds && blk.gmax > 0.0) ? blk.sc * 127.0 / blk.gmax : 0.0;
+    const vec4 w0 = clamp(round((vec4(unpack8(blk.qs0)) - 32.0) * f), -127.0, 127.0);
+    const vec4 w1 = clamp(round((vec4(unpack8(blk.qs1)) - 32.0) * f), -127.0, 127.0);
+    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2    ] = uint32_t(pack32(i8vec4(w0)));
+    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2 + 1] = uint32_t(pack32(i8vec4(w1)));
+    if (ks == 0 && loadr == 0) {
+        buf_a_d[buf_ib] = in_bounds ? blk.d * blk.gmax / 127.0 : 0.0;
+    }
+}
+
+#elif defined(DATA_A_Q4_0)
 
 struct block_a_prefetch {
     uint32_t qs;
@@ -245,10 +380,13 @@ void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
 
 #elif defined(DATA_A_Q4_K)
 
+// llama-rdna: the sub-block scale (d*sc) and min (dmin*m) are decoded in the prefetch phase and carried in registers,
+// so block_a_to_shmem issues no global loads (the stock shader loaded 3 scale bytes and dm right before the shared-memory
+// store, exposing that latency between the barriers on every k-group).
 struct block_a_prefetch {
     uint32_t qs0;
     uint32_t qs1;
-    uint ib;
+    vec2 dm;        // (d * sc, -(dmin * m)) for this 32-wide sub-block
 };
 
 block_a_prefetch block_a_load(uint ib, uint loadr) {
@@ -266,7 +404,18 @@ block_a_prefetch block_a_load(uint ib, uint loadr) {
         blk.qs0 = raw0 & 0x0F0F0F0F;
         blk.qs1 = raw1 & 0x0F0F0F0F;
     }
-    blk.ib = ib;
+#if defined(CM1_DBG) && CM1_DBG == 3
+    blk.dm = vec2(0.001, -0.001);   // timing-only: no scale loads
+#else
+    const uint j = sub & 3u;
+    const uint s_j  = uint(data_a[ib_k].scales[j]);
+    const uint s_j4 = uint(data_a[ib_k].scales[j + 4]);
+    const uint s_j8 = uint(data_a[ib_k].scales[j + 8]);
+    const uint sc_val = (sub < 4) ? (s_j  & 0x3Fu) : ((s_j8 & 0x0Fu) | ((s_j  >> 6) << 4));
+    const uint mn_val = (sub < 4) ? (s_j4 & 0x3Fu) : ((s_j4 >> 6) << 4 | (s_j8 >> 4));
+    const vec2 dm = vec2(data_a_packed32[ib_k].dm);
+    blk.dm = vec2(dm.x * float(sc_val), -(dm.y * float(mn_val)));
+#endif
 
     return blk;
 }
@@ -277,28 +426,19 @@ void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
     buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2 + 1] = blk.qs1;
 
     if (loadr == 0) {
-        const uint ib_k = blk.ib / 8;
-        const uint sub = blk.ib % 8;
-        const uint j = sub & 3u;
-        const uint s_j  = uint(data_a[ib_k].scales[j]);
-        const uint s_j4 = uint(data_a[ib_k].scales[j + 4]);
-        const uint s_j8 = uint(data_a[ib_k].scales[j + 8]);
-        const uint sc_val = (sub < 4) ? (s_j  & 0x3Fu) : ((s_j8 & 0x0Fu) | ((s_j  >> 6) << 4));
-        const uint mn_val = (sub < 4) ? (s_j4 & 0x3Fu) : ((s_j8 >> 4)    | ((s_j4 >> 6) << 4));
-        vec2 dm = vec2(data_a_packed32[ib_k].dm);
-        float d_scaled = dm.x * float(sc_val);
-        buf_a_dm[ks * BM + buf_ib] = in_bounds ? vec2(d_scaled, -(dm.y * float(mn_val))) : vec2(0.0f);
+        buf_a_dm[ks * BM + buf_ib] = in_bounds ? blk.dm : vec2(0.0f);
     }
 }
 
 #elif defined(DATA_A_Q5_K)
 
+// llama-rdna: scales decoded in the prefetch phase (see Q4_K above)
 struct block_a_prefetch {
     uint32_t qs0;
     uint32_t qs1;
     uint32_t qh0;
     uint32_t qh1;
-    uint ib;
+    vec2 dm;
 };
 
 block_a_prefetch block_a_load(uint ib, uint loadr) {
@@ -318,7 +458,14 @@ block_a_prefetch block_a_load(uint ib, uint loadr) {
     }
     blk.qh0 = ((data_a_packed32[ib_k].qh[loadr * 2    ] >> sub) & 0x01010101) << 4;
     blk.qh1 = ((data_a_packed32[ib_k].qh[loadr * 2 + 1] >> sub) & 0x01010101) << 4;
-    blk.ib = ib;
+    const uint j = sub & 3u;
+    const uint s_j  = uint(data_a[ib_k].scales[j]);
+    const uint s_j4 = uint(data_a[ib_k].scales[j + 4]);
+    const uint s_j8 = uint(data_a[ib_k].scales[j + 8]);
+    const uint sc_val = (sub < 4) ? (s_j  & 0x3Fu) : ((s_j8 & 0x0Fu) | ((s_j  >> 6) << 4));
+    const uint mn_val = (sub < 4) ? (s_j4 & 0x3Fu) : ((s_j8 >> 4)    | ((s_j4 >> 6) << 4));
+    const vec2 dm = vec2(data_a_packed32[ib_k].dm);
+    blk.dm = vec2(dm.x * float(sc_val), -(dm.y * float(mn_val)));
 
     return blk;
 }
@@ -331,26 +478,17 @@ void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
     buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2 + 1] = v1;
 
     if (loadr == 0) {
-        const uint ib_k = blk.ib / 8;
-        const uint sub = blk.ib % 8;
-        const uint j = sub & 3u;
-        const uint s_j  = uint(data_a[ib_k].scales[j]);
-        const uint s_j4 = uint(data_a[ib_k].scales[j + 4]);
-        const uint s_j8 = uint(data_a[ib_k].scales[j + 8]);
-        const uint sc_val = (sub < 4) ? (s_j  & 0x3Fu) : ((s_j8 & 0x0Fu) | ((s_j  >> 6) << 4));
-        const uint mn_val = (sub < 4) ? (s_j4 & 0x3Fu) : ((s_j8 >> 4)    | ((s_j4 >> 6) << 4));
-        vec2 dm = vec2(data_a_packed32[ib_k].dm);
-        float d_scaled = dm.x * float(sc_val);
-        buf_a_dm[ks * BM + buf_ib] = in_bounds ? vec2(d_scaled, -(dm.y * float(mn_val))) : vec2(0.0f);
+        buf_a_dm[ks * BM + buf_ib] = in_bounds ? blk.dm : vec2(0.0f);
     }
 }
 
 #elif defined(DATA_A_Q6_K)
 
+// llama-rdna: the two per-16 scales (d * sc) decoded in the prefetch phase (see Q4_K above)
 struct block_a_prefetch {
     uint32_t qs0;
     uint32_t qs1;
-    uint ib;
+    vec2 d2;
 };
 
 block_a_prefetch block_a_load(uint ib, uint loadr) {
@@ -383,7 +521,11 @@ block_a_prefetch block_a_load(uint ib, uint loadr) {
 
     blk.qs0 = ql0 | (((qh0 >> qh_shift) & 0x03030303) << 4);
     blk.qs1 = ql1 | (((qh1 >> qh_shift) & 0x03030303) << 4);
-    blk.ib = ib;
+    {
+        const i8vec2 sc = unpack8(int32_t(int16_t(data_a_packed16[ib_k].scales[sub]))).xy;
+        const float d = float(data_a_packed16[ib_k].d);
+        blk.d2 = vec2(d * float(sc.x), d * float(sc.y));
+    }
 
     return blk;
 }
@@ -395,11 +537,8 @@ void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
     buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2 + 1] = v1;
 
     if (loadr == 0) {
-        const uint ib_k = blk.ib / 8;
-        const uint sub = blk.ib % 8;
-        i8vec2 sc = unpack8(int32_t(int16_t(data_a_packed16[ib_k].scales[sub]))).xy;
-        buf_a_d[(ks * KSCALES    ) * BM + buf_ib] = in_bounds ? float(data_a_packed16[ib_k].d) * float(sc.x) : 0.0f;
-        buf_a_d[(ks * KSCALES + 1) * BM + buf_ib] = in_bounds ? float(data_a_packed16[ib_k].d) * float(sc.y) : 0.0f;
+        buf_a_d[(ks * KSCALES    ) * BM + buf_ib] = in_bounds ? blk.d2.x : 0.0f;
+        buf_a_d[(ks * KSCALES + 1) * BM + buf_ib] = in_bounds ? blk.d2.y : 0.0f;
     }
 }
 
@@ -511,7 +650,7 @@ void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
 struct block_b_prefetch {
     ivec4 qs;
     float16_t d;
-#if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+#if defined(CM1_NEEDS_BSUM)
     float16_t s;
 #endif
 };
@@ -520,7 +659,7 @@ block_b_prefetch block_b_load(uint ib_outer, uint ib_inner, uint loadr) {
     block_b_prefetch blk;
     blk.qs = data_b[ib_outer].qs[ib_inner * 2 + loadr];
     blk.d = data_b[ib_outer].ds[ib_inner].x;
-#if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+#if defined(CM1_NEEDS_BSUM)
     blk.s = data_b[ib_outer].ds[ib_inner].y;
 #endif
     return blk;
@@ -535,7 +674,7 @@ void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
     buf_b_qs[base + 3] = v.w;
     if (loadr == 0) {
         buf_b_d[ks * BN + buf_ib] = in_bounds ? float(blk.d) : 0.0f;
-#if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+#if defined(CM1_NEEDS_BSUM)
         buf_b_s[ks * BN + buf_ib] = in_bounds ? float(blk.s) : 0.0f;
 #endif
     }

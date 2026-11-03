@@ -634,6 +634,16 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         if (!f16acc && coopmat && (tname == "q4_0" || tname == "q4_1" || tname == "q5_0" || tname == "q5_1" || tname == "q8_0" || tname == "iq4_nl" || tname == "iq4_xs" || tname == "mxfp4"
                      || tname == "q3_k" || tname == "q4_k" || tname == "q5_k" || tname == "q6_k" || tname == "nvfp4")) {
             string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"D_TYPE_VEC4", "vec4"}}), fp16, coopmat, coopmat2, f16acc);
+            if ((tname == "q4_k" || tname == "q5_k" || tname == "q6_k") && shader_name == "matmul") {
+                // llama-rdna: per-128 requantized staging and one epilogue per 128 k (mul_mmq_cm1.comp CM1_REQ)
+                string_to_spv(shader_name + "_" + tname + "_q8_1_req", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"D_TYPE_VEC4", "vec4"}, {"CM1_REQ", "1"}}), fp16, coopmat, coopmat2, f16acc);
+            }
+            if (tname == "q4_k" && shader_name == "matmul") {
+                // llama-rdna: timing-only attribution variants (see GGML_VK_CM1_DBG)
+                for (int dbg = 1; dbg <= 5; ++dbg) {
+                    string_to_spv(shader_name + "_" + tname + "_q8_1_dbg" + std::to_string(dbg), "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"D_TYPE_VEC4", "vec4"}, {"CM1_DBG", std::to_string(dbg)}}), fp16, coopmat, coopmat2, f16acc);
+                }
+            }
         }
 
         if (is_lut_quant(tname)) {
@@ -818,6 +828,10 @@ void process_shaders() {
             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}}));
             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32_subgroup", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32_subgroup_no_shmem", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+            if (tname == "q4_k") {
+                // llama-rdna: gate/up pair of a SwiGLU FFN with the GLU in the epilogue (MMVQ_DUAL_GLU in mul_mat_vecq.comp)
+                string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32_dualglu", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}, {"MMVQ_DUAL_GLU", "1"}}));
+            }
 
             string_to_spv("mul_mat_vec_id_" + tname + "_q8_1_f32", "mul_mat_vecq.comp", merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}}));
             string_to_spv("mul_mat_vec_id_" + tname + "_q8_1_f32_subgroup", "mul_mat_vecq.comp", merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
@@ -858,6 +872,8 @@ void process_shaders() {
         const auto rms_dict = merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", use_subgroups ? "1" : "0"}});
         string_to_spv("rms_norm_f32" + suffix, "rms_norm.comp", rms_dict);
         string_to_spv("rms_norm_mul_add_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"RMS_NORM_ADD_FUSION", "1"}}));
+        string_to_spv("rms_norm_mul_mul_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"RMS_NORM_MUL_MUL_FUSION", "1"}}));
+        string_to_spv("rms_norm_mul_q8_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"RMS_NORM_Q8_FUSION", "1"}}));
         string_to_spv("rms_norm_set_rows_f32_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"RMS_NORM_SET_ROWS_FUSION", "1"}}));
         string_to_spv("rms_norm_set_rows_f32_f16" + suffix, "rms_norm.comp", merge_maps({{"D_TYPE", "float16_t"}, {"RMS_NORM_SET_ROWS_FUSION", "1"}}, rms_dict)); // keep rms_dict last so 'merge_maps' overwrites the value for key 'D_TYPE'
         string_to_spv("rms_norm_mul_rope_f32_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"ROPE_D_TYPE", "float"}, {"RMS_NORM_ROPE_FUSION", "1"}}));
@@ -933,6 +949,24 @@ void process_shaders() {
 
     string_to_spv("split_k_reduce", "mul_mat_split_k_reduce.comp", {});
     string_to_spv("fa_split_k_reduce", "flash_attn_split_k_reduce.comp", {});
+    string_to_spv("fa_dec", "flash_attn_dec.comp", {});
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    string_to_spv("fa_dec_cm_r48", "flash_attn_dec_cm.comp", {{"NRT", "3"}}, true, true);
+    string_to_spv("fa_dec_cm_r32", "flash_attn_dec_cm.comp", {{"NRT", "2"}}, true, true);
+    // llama-rdna: prefill attention, wave32, one variant per KV type (flash_attn_pf.comp)
+    string_to_spv("fa_pf_q4_0", "flash_attn_pf.comp", {{"KV_T", "2"}}, true, true);
+    string_to_spv("fa_pf_q8_0", "flash_attn_pf.comp", {{"KV_T", "8"}}, true, true);
+    string_to_spv("fa_pf_f16",  "flash_attn_pf.comp", {{"KV_T", "1"}}, true, true);
+    // 32-key tiles: half the shared memory, two workgroups per CU (GGML_VK_FA_PF_BC=32)
+    string_to_spv("fa_pf32_q4_0", "flash_attn_pf.comp", {{"KV_T", "2"}, {"BC", "32"}}, true, true);
+    string_to_spv("fa_pf32_q8_0", "flash_attn_pf.comp", {{"KV_T", "8"}, {"BC", "32"}}, true, true);
+    string_to_spv("fa_pf32_f16",  "flash_attn_pf.comp", {{"KV_T", "1"}, {"BC", "32"}}, true, true);
+    string_to_spv("fa_dec_cmq", "flash_attn_dec_cmq.comp", {}, true, true);
+    // llama-rdna: decode / verify attention, wave32, q4_0, one variant per number of 16-row query tiles (flash_attn_dec_w.comp)
+    string_to_spv("fa_dec_w_qt1", "flash_attn_dec_w.comp", {{"QT", "1"}}, true, true);
+    string_to_spv("fa_dec_w_qt2", "flash_attn_dec_w.comp", {{"QT", "2"}}, true, true);
+    string_to_spv("fa_dec_w_qt3", "flash_attn_dec_w.comp", {{"QT", "3"}}, true, true);
+#endif // llama-rdna
 
     string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});
 
@@ -949,6 +983,9 @@ void process_shaders() {
 
     string_to_spv("quantize_q8_1_x4", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}});
     string_to_spv("quantize_q8_1_x4_subgroup", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"USE_SUBGROUPS", "1"}});
+    // llama-rdna: one scale per 128 values, for the requantized K-quant GEMM (mul_mmq_cm1.comp CM1_REQ)
+    string_to_spv("quantize_q8_1_x4_g128", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"QBLOCK_X4_G128", "1"}});
+    string_to_spv("quantize_q8_1_x4_g128_subgroup", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"QBLOCK_X4_G128", "1"}, {"USE_SUBGROUPS", "1"}});
 
     string_to_spv("mul_f32", "mul.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 

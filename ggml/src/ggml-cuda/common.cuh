@@ -24,6 +24,8 @@
 
 #include <array>
 #include <algorithm>
+#include <cinttypes>
+#include <map>
 #include <cassert>
 #include <cfloat>
 #include <cstdio>
@@ -1295,10 +1297,160 @@ struct ggml_cuda_graph {
     std::vector<node_properties> node_props;
 
     bool is_enabled() const {
-        static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
+        static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr) ||
+            (getenv("GGML_CUDA_PERF_LOGGER") != nullptr); // per-op timing needs direct launches
         return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);
     }
 #endif
+};
+
+// Per-op GPU timing for profiling (GGML_CUDA_PERF_LOGGER=1, GGML_CUDA_PERF_LOGGER_FREQUENCY=N graphs).
+// A one-thread kernel writes a device timestamp before and after every launched op (fused groups count as one);
+// the stamps are copied back once per graph. No events: on ROCm each timing event pins host memory and a few
+// thousand of them drove the test machine into swap (probe-1, 2026-11-01).
+void ggml_cuda_perf_stamp(uint64_t * dst, cudaStream_t stream); // defined in ggml-cuda.cu
+
+struct ggml_cuda_perf_logger {
+    bool   enabled   = false;
+    int    frequency = 1;
+    int    n_graphs  = 0;
+    static constexpr size_t max_stamps = 1u << 15;
+    uint64_t * d_stamps = nullptr;
+    std::vector<uint64_t> h_stamps;
+    size_t n_used       = 0;
+    double ticks_per_us = 1000.0;
+    struct rec { std::string name; size_t s0; size_t s1; };
+    std::vector<rec> recs;
+    struct acc_t { uint64_t count = 0; double ms = 0.0; };
+    std::map<std::string, acc_t> acc;
+
+    ggml_cuda_perf_logger() {
+        enabled = getenv("GGML_CUDA_PERF_LOGGER") != nullptr;
+        if (const char * f = getenv("GGML_CUDA_PERF_LOGGER_FREQUENCY")) {
+            frequency = std::max(1, atoi(f));
+        }
+    }
+
+    ~ggml_cuda_perf_logger() {
+        if (enabled && !acc.empty()) {
+            print();
+        }
+        if (d_stamps) {
+            cudaFree(d_stamps);
+        }
+    }
+
+    void init(int device) {
+        if (d_stamps) {
+            return;
+        }
+        CUDA_CHECK(cudaMalloc(&d_stamps, max_stamps * sizeof(uint64_t)));
+        h_stamps.resize(max_stamps);
+#if defined(GGML_USE_HIP)
+        int khz = 0;
+        if (hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, device) == hipSuccess && khz > 0) {
+            ticks_per_us = khz / 1000.0;
+        }
+#else
+        GGML_UNUSED(device); // %globaltimer counts nanoseconds
+#endif
+    }
+
+    size_t stamp(cudaStream_t stream) {
+        if (n_used >= max_stamps) {
+            return max_stamps;
+        }
+        ggml_cuda_perf_stamp(d_stamps + n_used, stream);
+        return n_used++;
+    }
+
+    static std::string node_name(const ggml_cgraph * cgraph, int i, int n_fused) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        std::string s;
+        if (n_fused > 1) {
+            s += "fused(" + std::to_string(n_fused) + ") ";
+            for (int k = 0; k < n_fused; ++k) {
+                s += ggml_op_desc(cgraph->nodes[i + k]);
+                s += k + 1 < n_fused ? "+" : " ";
+            }
+        } else {
+            s += ggml_op_desc(node);
+            s += " ";
+        }
+        const ggml_tensor * src0 = node->src[0];
+        const ggml_tensor * src1 = node->src[1];
+        char buf[256];
+        switch (node->op) {
+            case GGML_OP_MUL_MAT:
+            case GGML_OP_MUL_MAT_ID:
+                snprintf(buf, sizeof(buf), "%s m=%" PRId64 " n=%" PRId64 " k=%" PRId64 " b=%" PRId64 "x%" PRId64,
+                         ggml_type_name(src0->type), src0->ne[1], src1->ne[1], src0->ne[0], src1->ne[2], src1->ne[3]);
+                break;
+            case GGML_OP_FLASH_ATTN_EXT:
+                snprintf(buf, sizeof(buf), "D=%" PRId64 " n_q=%" PRId64 " n_kv=%" PRId64 " h=%" PRId64 "/%" PRId64 " K=%s V=%s",
+                         src0->ne[0], src0->ne[1], src1->ne[1], src0->ne[2], src1->ne[2],
+                         ggml_type_name(src1->type), ggml_type_name(node->src[2]->type));
+                break;
+            default:
+                snprintf(buf, sizeof(buf), "%s [%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]",
+                         src0 ? ggml_type_name(src0->type) : "-", node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
+                break;
+        }
+        s += buf;
+        return s;
+    }
+
+    void begin_node(int device, const ggml_cgraph * cgraph, int i, cudaStream_t stream) {
+        init(device);
+        recs.push_back({ node_name(cgraph, i, 1), stamp(stream), max_stamps });
+    }
+
+    void end_node(const ggml_cgraph * cgraph, int i, int n_fused, cudaStream_t stream) {
+        rec & r = recs.back();
+        if (n_fused > 1) {
+            r.name = node_name(cgraph, i, n_fused);
+        }
+        r.s1 = stamp(stream);
+    }
+
+    void end_graph(cudaStream_t stream) {
+        if (n_used > 0) {
+            CUDA_CHECK(cudaMemcpyAsync(h_stamps.data(), d_stamps, n_used * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+        for (const rec & r : recs) {
+            if (r.s0 >= n_used || r.s1 >= n_used) {
+                continue;
+            }
+            const double us = (double) (h_stamps[r.s1] - h_stamps[r.s0]) / ticks_per_us;
+            acc_t & a = acc[r.name];
+            a.count += 1;
+            a.ms    += us / 1000.0;
+        }
+        recs.clear();
+        n_used = 0;
+        if (++n_graphs % frequency != 0) {
+            return;
+        }
+        print();
+    }
+
+    void print() {
+        std::vector<std::pair<std::string, acc_t>> rows(acc.begin(), acc.end());
+        std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) { return a.second.ms > b.second.ms; });
+        double total = 0.0;
+        for (const auto & r : rows) {
+            total += r.second.ms;
+        }
+        fprintf(stderr, "----------------\nCUDA Timings (%d graphs):\n", n_graphs);
+        for (const auto & r : rows) {
+            fprintf(stderr, "%s: %" PRIu64 " x %.1f us = %.1f us (%.1f%%)\n", r.first.c_str(), r.second.count,
+                    1000.0 * r.second.ms / r.second.count, 1000.0 * r.second.ms, 100.0 * r.second.ms / std::max(total, 1e-9));
+        }
+        fprintf(stderr, "Total time: %.1f us.\n", 1000.0 * total);
+        acc.clear();
+        n_graphs = 0;
+    }
 };
 
 struct ggml_cuda_concurrent_event {
@@ -1456,6 +1608,8 @@ struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+
+    ggml_cuda_perf_logger perf_logger; // GGML_CUDA_PERF_LOGGER=1 per-op timing, see ggml_cuda_graph_evaluate_and_capture
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};

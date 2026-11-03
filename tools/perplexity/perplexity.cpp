@@ -11,6 +11,7 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -253,11 +254,11 @@ static std::pair<double, float> log_softmax(int n_vocab, const float * logits, c
 
 static void process_logits(int n_vocab, const float * logits, const int * tokens, int n_token,
         std::vector<std::thread> & workers, const std::vector<uint16_t> & base_log_probs, kl_divergence_result & kld,
-        float * kld_values, float * p_diff_values) {
+        float * kld_values, float * p_diff_values, uint8_t * same_top_values = nullptr) {
     std::mutex mutex;
     const int nv = 2*((n_vocab + 1)/2) + 4;
     int counter = 0;
-    auto compute = [&mutex, &counter, &base_log_probs, &kld, n_vocab, logits, tokens, n_token, nv, kld_values, p_diff_values] () {
+    auto compute = [&mutex, &counter, &base_log_probs, &kld, n_vocab, logits, tokens, n_token, nv, kld_values, p_diff_values, same_top_values] () {
         kl_divergence_result local_kld;
         while (true) {
             std::unique_lock<std::mutex> lock(mutex);
@@ -279,9 +280,13 @@ static void process_logits(int n_vocab, const float * logits, const int * tokens
                 break;
             }
             lock.unlock();
+            const size_t n_same_top0 = local_kld.n_same_top;
             std::pair<double, float> v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, base_log_probs.data() + size_t(i)*nv, tokens[i+1], local_kld);
             kld_values[i]    = (float)v.first;
             p_diff_values[i] = v.second;
+            if (same_top_values) {
+                same_top_values[i] = local_kld.n_same_top != n_same_top0;
+            }
         }
     };
     for (auto & w : workers) {
@@ -1738,6 +1743,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     std::vector<uint16_t> log_probs_uint16(size_t(n_ctx - 1 - n_ctx/2) * nv);
     std::vector<float>    kld_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
     std::vector<float> p_diff_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
+    std::vector<uint8_t> same_top_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
     std::vector<float> logits;
     if (num_batches > 1) {
         logits.reserve(size_t(n_ctx) * n_vocab);
@@ -1768,6 +1774,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     kl_divergence_result kld;
     auto    kld_ptr =    kld_values.data();
     auto p_diff_ptr = p_diff_values.data();
+    auto same_top_ptr = same_top_values.data();
 
     const int first = n_ctx/2;
 
@@ -1847,9 +1854,10 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
             const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
 
             process_logits(n_vocab, all_logits, tokens.data() + start + seq*n_ctx + first, n_ctx - 1 - first,
-                    workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr);
-            p_diff_ptr += n_ctx - 1 - first;
-            kld_ptr    += n_ctx - 1 - first;
+                    workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr, same_top_ptr);
+            p_diff_ptr   += n_ctx - 1 - first;
+            kld_ptr      += n_ctx - 1 - first;
+            same_top_ptr += n_ctx - 1 - first;
 
             LOG("%4d", i + seq + 1);
 
@@ -1885,6 +1893,17 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     LOG("\n");
 
     if (kld.count < 100) return; // we do not wish to do statistics on so few values
+
+    // llama-rdna: LLAMA_KLD_DUMP=<file> writes the per-token values in token order (uint32 count, float KLD[count],
+    // float delta-p[count], uint8 same-top[count]) so two builds can be compared token by token (bench/kld_pair.py)
+    if (const char * dump = getenv("LLAMA_KLD_DUMP")) {
+        std::ofstream f(dump, std::ios::binary);
+        const uint32_t n = (uint32_t) kld.count;
+        f.write((const char *) &n, sizeof(n));
+        f.write((const char *) kld_values.data(),      n*sizeof(float));
+        f.write((const char *) p_diff_values.data(),   n*sizeof(float));
+        f.write((const char *) same_top_values.data(), n*sizeof(uint8_t));
+    }
 
     std::sort(kld_values.begin(), kld_values.end());
     std::sort(p_diff_values.begin(), p_diff_values.end());

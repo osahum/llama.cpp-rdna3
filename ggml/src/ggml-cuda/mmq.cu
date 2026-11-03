@@ -158,6 +158,17 @@ static int ggml_cuda_mmq_get_J_best(
             ntiles_J_best = ntiles_x;
         }
     }
+    // llama-rdna: GGML_CUDA_MMQ_J=<8..128> forces the tile width for sweeps (ignored if no such config exists)
+    static const int J_env = getenv("GGML_CUDA_MMQ_J") ? atoi(getenv("GGML_CUDA_MMQ_J")) : 0;
+    if (J_env >= 8 && J_env <= 128 && J_env % 8 == 0) {
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J_env, fallback, cc, prec_src1);
+        if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
+            if (nthreads_best) {
+                *nthreads_best = config.nthreads;
+            }
+            return J_env;
+        }
+    }
     return J_best;
 }
 
@@ -436,6 +447,12 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         return true;
     }
 
+    // llama-rdna: runtime switch to compare MMQ against dequant + hipBLAS on the same build
+    static const bool force_mmq_env = getenv("GGML_CUDA_FORCE_MMQ") != nullptr;
+    if (force_mmq_env) {
+        return true;
+    }
+
     if (ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_DP4A) {
         // for MoE, mmq is faster even without native dp4a
         // TODO: check if cards older than pascal might benefit from this as well
@@ -484,7 +501,8 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
                 case GGML_TYPE_Q2_K:
                     return ne11 <= 128;
                 case GGML_TYPE_Q6_K:
-                    return ne11 <= (GGML_CUDA_CC_IS_RDNA3_0(cc) ? 128 : 256);
+                    // llama-rdna: with the (128, 2, 128) RDNA3 tile, MMQ Q6_K measured 72 TFLOPS vs 55 through hipBLAS (probe-8)
+                    return GGML_CUDA_CC_IS_RDNA3_0(cc) ? true : ne11 <= 256;
                 case GGML_TYPE_IQ2_XS:
                 case GGML_TYPE_IQ2_S:
                     return GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4_M(cc) || ne11 <= 128;

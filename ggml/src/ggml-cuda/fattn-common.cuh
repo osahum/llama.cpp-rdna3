@@ -44,6 +44,35 @@ typedef void (* fattn_kernel_t)(
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
 
+// llama-rdna: on RDNA the mma kernel reads q4_0/q8_0 K/V straight from the cache (dequantized while filling the shared
+// tile) instead of converting the whole K/V view to f16 per call; this also removes the f16 copies from the graph reserve.
+// GGML_CUDA_FATTN_MMA_QUANT_KV=0 restores the conversion path.
+static bool ggml_cuda_fattn_mma_reads_quant_kv(const ggml_tensor * dst) {
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    static const bool disabled = getenv("GGML_CUDA_FATTN_MMA_QUANT_KV") != nullptr && atoi(getenv("GGML_CUDA_FATTN_MMA_QUANT_KV")) == 0;
+    if (disabled) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!amd_wmma_available(cc)) {
+        return false; // only the synchronous (non cp.async) tile loader has the dequantizing variant
+    }
+    if (K->type != V->type || (K->type != GGML_TYPE_Q4_0 && K->type != GGML_TYPE_Q8_0)) {
+        return false;
+    }
+    if (K->data == V->data) {
+        return false; // V is a view of K (MLA)
+    }
+    if (K->ne[0] % 32 != 0 || V->ne[0] % 32 != 0) {
+        return false;
+    }
+    if (K->nb[0] != ggml_type_size(K->type) || V->nb[0] != ggml_type_size(V->type)) {
+        return false;
+    }
+    return true;
+}
+
 struct ggml_cuda_flash_attn_ext_f16_extra_data {
     uintptr_t K;
     uintptr_t V;

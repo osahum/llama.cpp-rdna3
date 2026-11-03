@@ -29,7 +29,42 @@ vec2 cache_b_ds;
 
 #include "mul_mat_vecq_funcs.glsl"
 
+// llama-rdna: A_OUTER = 1 (q4_K, q5_K): decode each weight sub-block (nibbles and 6-bit scales) once per iteration and
+// reuse it for every column, instead of once per column. Same per-column expression, same accumulation order.
+layout (constant_id = 3) const uint A_OUTER = 0;
+
 void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint col, const uint b_qs_idx) {
+#if defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+    if (A_OUTER != 0) {
+        int32_t bq[NUM_COLS][4];
+        vec2    bd[NUM_COLS];
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint b_block_idx = (j*p.batch_stride_b + col) / QUANT_K_Q8_1 + b_offset;
+            const uint b_block_idx_outer = b_block_idx / 4;
+            const uint b_block_idx_inner = b_block_idx % 4;
+            bd[j] = vec2(data_b[b_block_idx_outer].ds[b_block_idx_inner]);
+            [[unroll]] for (uint q = 0; q < 4; ++q) {
+                bq[j][q] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx * 4 + q];
+            }
+        }
+        uint ibi = first_row*p.ncols;
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            const uint a_block_idx = (ibi + col)/QUANT_K_Q8_1 + a_offset;
+            ibi += p.ncols;
+            const i32vec4 qs_a = repack4(a_block_idx, b_qs_idx * 4);
+            const vec2 dm_scale = get_dm_scale(a_block_idx, b_qs_idx * 4);
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                int32_t q_sum = 0;
+                q_sum += dotPacked4x8EXT(qs_a.x, bq[j][0]);
+                q_sum += dotPacked4x8EXT(qs_a.y, bq[j][1]);
+                q_sum += dotPacked4x8EXT(qs_a.z, bq[j][2]);
+                q_sum += dotPacked4x8EXT(qs_a.w, bq[j][3]);
+                temp[j][n] += FLOAT_TYPE(float(bd[j].x) * float(dm_scale.x) * float(q_sum) - float(dm_scale.y) * float(bd[j].y / 2));
+            }
+        }
+        return;
+    }
+#endif
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
         // Preload data_b block
         const uint b_block_idx = (j*p.batch_stride_b + col) / QUANT_K_Q8_1 + b_offset;
@@ -123,7 +158,337 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     reduce_result(temp, d_offset, first_row, num_rows, tid);
 }
 
+// llama-rdna: PERSIST = 1 (q4_K / q5_K, up to 4 columns, K <= P_ITERS * K_PER_ITER * BLOCK_SIZE): a fixed number of
+// workgroups each loads its lanes' activations once into registers, then walks the rows NUM_ROWS at a time with a
+// stride of NUM_ROWS * workgroups. The lane-to-k mapping, the per-row accumulation order and the reduction are those
+// of compute_outputs with A_OUTER, so the results are bit-identical; what changes is that the activations are read
+// once per workgroup instead of once per row, and that no tail of short-lived workgroups is left at the end.
+layout (constant_id = 4) const uint PERSIST = 0;
+#define P_ITERS 6
+
+#if !defined(MUL_MAT_ID) && (defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K))
+void persist_outputs() {
+    const uint tid = gl_LocalInvocationID.x;
+
+    get_offsets(a_offset, b_offset, d_offset);
+    a_offset *= QUANT_K / QUANT_K_Q8_1;
+    b_offset /= QUANT_K_Q8_1;
+
+    const uint col_stride = K_PER_ITER * BLOCK_SIZE;
+    uint num_iters = p.ncols / col_stride;
+    if (num_iters * col_stride + K_PER_ITER * tid < p.ncols) {
+        num_iters++;
+    }
+    const uint b_qs_idx = tid % (32 / K_PER_ITER);
+
+    int32_t bq[P_ITERS][NUM_COLS][4];
+    vec2    bd[P_ITERS][NUM_COLS];
+    [[unroll]] for (uint i = 0; i < P_ITERS; ++i) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            bd[i][j] = vec2(0.0f);
+            [[unroll]] for (uint q = 0; q < 4; ++q) {
+                bq[i][j][q] = 0;
+            }
+        }
+        if (i < num_iters) {
+            const uint col = tid * K_PER_ITER + i * col_stride;
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                const uint b_block_idx = (j*p.batch_stride_b + col) / QUANT_K_Q8_1 + b_offset;
+                const uint b_block_idx_outer = b_block_idx / 4;
+                const uint b_block_idx_inner = b_block_idx % 4;
+                bd[i][j] = vec2(data_b[b_block_idx_outer].ds[b_block_idx_inner]);
+                [[unroll]] for (uint q = 0; q < 4; ++q) {
+                    bq[i][j][q] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx * 4 + q];
+                }
+            }
+        }
+    }
+
+    for (uint first_row = NUM_ROWS * gl_WorkGroupID.x; first_row < p.stride_d; first_row += NUM_ROWS * gl_NumWorkGroups.x) {
+        const uint num_rows = min(NUM_ROWS, p.stride_d - first_row);
+
+        FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                temp[j][n] = FLOAT_TYPE(0.0f);
+            }
+        }
+
+        [[unroll]] for (uint i = 0; i < P_ITERS; ++i) {
+            if (i < num_iters) {
+                const uint col = tid * K_PER_ITER + i * col_stride;
+                uint ibi = first_row*p.ncols;
+                [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                    if (n < num_rows) {
+                        const uint a_block_idx = (ibi + col)/QUANT_K_Q8_1 + a_offset;
+                        const i32vec4 qs_a = repack4(a_block_idx, b_qs_idx * 4);
+                        const vec2 dm_scale = get_dm_scale(a_block_idx, b_qs_idx * 4);
+                        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                            int32_t q_sum = 0;
+                            q_sum += dotPacked4x8EXT(qs_a.x, bq[i][j][0]);
+                            q_sum += dotPacked4x8EXT(qs_a.y, bq[i][j][1]);
+                            q_sum += dotPacked4x8EXT(qs_a.z, bq[i][j][2]);
+                            q_sum += dotPacked4x8EXT(qs_a.w, bq[i][j][3]);
+                            temp[j][n] += FLOAT_TYPE(float(bd[i][j].x) * float(dm_scale.x) * float(q_sum) - float(dm_scale.y) * float(bd[i][j].y / 2));
+                        }
+                    }
+                    ibi += p.ncols;
+                }
+            }
+        }
+
+        reduce_result(temp, d_offset, first_row, num_rows, tid);
+    }
+}
+#endif
+
+#if MMVQ_DUAL_GLU
+// llama-rdna: the gate/up pair of a SwiGLU FFN in one dispatch: binding 0 holds the gate weights, binding 5 the up
+// weights (same type and shape), both multiplied by the same activations; the output is silu(gate) * up with the
+// swiglu.comp expression. Each of the two dot products is the lean path's, so the result equals MUL_MAT, MUL_MAT, GLU.
+layout (binding = 5) readonly buffer A2_PACKED32 {A_TYPE_PACKED32 data_a2_packed32[];};
+#endif
+
+// llama-rdna: LEAN = 1 (q4_K / q5_K, one row per workgroup, K a multiple of K_PER_ITER * BLOCK_SIZE): every iteration
+// moves a lane by K_PER_ITER * BLOCK_SIZE columns, a whole number of superblocks, so the lane's position inside the
+// superblock, the nibble shift, the scale-decode shifts and the q8_1 block inside the x4 block never change; they are
+// computed once and the loop only steps the superblock and x4-block indices. compute_outputs with A_OUTER recomputes
+// all of it from divisions per iteration and column. Same values, same per-column expression, same order.
+layout (constant_id = 5) const uint LEAN = 0;
+
+#if !defined(MUL_MAT_ID) && (defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K))
+// lane constants of the lean path (set once by lean_setup). The weight and activation blocks are read through dword
+// views: the lane's dword indices are computed once, and each iteration adds compile-time strides, so the loop does no
+// index multiplies (the struct-indexed form multiplied every block index by the 144- or 176-byte block size).
+layout (binding = 0) readonly buffer A_RAW32 { uint data_a_raw32[]; };
+layout (binding = 1) readonly buffer B_RAW32 { uint data_b_raw32[]; };
+#if defined(DATA_A_Q4_K)
+const uint LN_A_DW = 36;   // block_q4_K: dm, scales[3], qs[32]
+const uint LN_A_QS = 4;
+#else
+const uint LN_A_DW = 44;   // block_q5_K: dm, scales[3], qh[8], qs[32]
+const uint LN_A_QH = 4;
+const uint LN_A_QS = 12;
+#endif
+const uint LN_B_DW   = 36; // block_q8_1_x4: ds[4], qs[32]
+const uint LN_A_STEP = (K_PER_ITER * BLOCK_SIZE / QUANT_K) * LN_A_DW;
+const uint LN_B_STEP = (K_PER_ITER * BLOCK_SIZE / (QUANT_K_Q8_1 * 4)) * LN_B_DW;
+
+uint ln_a0, ln_aqs, ln_qs_shift, ln_iqs;
+#if defined(DATA_A_Q5_K)
+uint ln_aqh, ln_qh_shift;
+#endif
+uint ln_scidx0, ln_scidxshift0, ln_scidxshift1, ln_mbidx0, ln_mbidxshift0, ln_mbidxshift1;
+uint ln_bds[NUM_COLS], ln_bqs[NUM_COLS];
+
+void lean_iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint i) {
+    const uint ao = i * LN_A_STEP;
+#if defined(DATA_A_Q4_K)
+    const i32vec4 qs_a = i32vec4((data_a_raw32[ln_aqs + ao    ] >> ln_qs_shift) & 0x0F0F0F0F,
+                                 (data_a_raw32[ln_aqs + ao + 1] >> ln_qs_shift) & 0x0F0F0F0F,
+                                 (data_a_raw32[ln_aqs + ao + 2] >> ln_qs_shift) & 0x0F0F0F0F,
+                                 (data_a_raw32[ln_aqs + ao + 3] >> ln_qs_shift) & 0x0F0F0F0F);
+#else
+    const i32vec4 qs_a = i32vec4(((data_a_raw32[ln_aqs + ao    ] >> ln_qs_shift) & 0x0F0F0F0F) |
+                                (((data_a_raw32[ln_aqh + ao    ] >> ln_qh_shift) & 0x01010101) << 4),
+                                 ((data_a_raw32[ln_aqs + ao + 1] >> ln_qs_shift) & 0x0F0F0F0F) |
+                                (((data_a_raw32[ln_aqh + ao + 1] >> ln_qh_shift) & 0x01010101) << 4),
+                                 ((data_a_raw32[ln_aqs + ao + 2] >> ln_qs_shift) & 0x0F0F0F0F) |
+                                (((data_a_raw32[ln_aqh + ao + 2] >> ln_qh_shift) & 0x01010101) << 4),
+                                 ((data_a_raw32[ln_aqs + ao + 3] >> ln_qs_shift) & 0x0F0F0F0F) |
+                                (((data_a_raw32[ln_aqh + ao + 3] >> ln_qh_shift) & 0x01010101) << 4));
+#endif
+    const uvec3 scales = uvec3(data_a_raw32[ln_a0 + ao + 1], data_a_raw32[ln_a0 + ao + 2], data_a_raw32[ln_a0 + ao + 3]);
+    const uint8_t sc    = uint8_t(((scales[ln_scidx0] >> ln_scidxshift0) & 0xF) | ((scales[0] >> ln_scidxshift1) & 0x30));
+    const uint8_t mbyte = uint8_t(((scales[ln_mbidx0] >> ln_mbidxshift0) & 0xF) | ((scales[1] >> ln_mbidxshift1) & 0x30));
+    const vec2 dm_scale = unpackHalf2x16(data_a_raw32[ln_a0 + ao]) * FLOAT_TYPEV2(u8vec2(sc, mbyte));
+
+    const uint bo = i * LN_B_STEP;
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        const vec2 ds = unpackHalf2x16(data_b_raw32[ln_bds[j] + bo]);
+        int32_t q_sum = 0;
+        q_sum += dotPacked4x8EXT(qs_a.x, int32_t(data_b_raw32[ln_bqs[j] + bo    ]));
+        q_sum += dotPacked4x8EXT(qs_a.y, int32_t(data_b_raw32[ln_bqs[j] + bo + 1]));
+        q_sum += dotPacked4x8EXT(qs_a.z, int32_t(data_b_raw32[ln_bqs[j] + bo + 2]));
+        q_sum += dotPacked4x8EXT(qs_a.w, int32_t(data_b_raw32[ln_bqs[j] + bo + 3]));
+        temp[j][0] += FLOAT_TYPE(float(ds.x) * float(dm_scale.x) * float(q_sum) - float(dm_scale.y) * float(ds.y / 2));
+    }
+}
+
+#if MMVQ_DUAL_GLU
+layout (binding = 5) readonly buffer A2_RAW32 { uint data_a2_raw32[]; };
+#if defined(DATA_A_Q4_K)
+#define LEAN_QS(BUF, ao) i32vec4((BUF[ln_aqs + ao    ] >> ln_qs_shift) & 0x0F0F0F0F, \
+                                 (BUF[ln_aqs + ao + 1] >> ln_qs_shift) & 0x0F0F0F0F, \
+                                 (BUF[ln_aqs + ao + 2] >> ln_qs_shift) & 0x0F0F0F0F, \
+                                 (BUF[ln_aqs + ao + 3] >> ln_qs_shift) & 0x0F0F0F0F)
+#else
+#define LEAN_QS(BUF, ao) i32vec4(((BUF[ln_aqs + ao    ] >> ln_qs_shift) & 0x0F0F0F0F) | (((BUF[ln_aqh + ao    ] >> ln_qh_shift) & 0x01010101) << 4), \
+                                 ((BUF[ln_aqs + ao + 1] >> ln_qs_shift) & 0x0F0F0F0F) | (((BUF[ln_aqh + ao + 1] >> ln_qh_shift) & 0x01010101) << 4), \
+                                 ((BUF[ln_aqs + ao + 2] >> ln_qs_shift) & 0x0F0F0F0F) | (((BUF[ln_aqh + ao + 2] >> ln_qh_shift) & 0x01010101) << 4), \
+                                 ((BUF[ln_aqs + ao + 3] >> ln_qs_shift) & 0x0F0F0F0F) | (((BUF[ln_aqh + ao + 3] >> ln_qh_shift) & 0x01010101) << 4))
+#endif
+vec2 lean_dm_scale(const uvec3 scales, const vec2 dm) {
+    const uint8_t sc    = uint8_t(((scales[ln_scidx0] >> ln_scidxshift0) & 0xF) | ((scales[0] >> ln_scidxshift1) & 0x30));
+    const uint8_t mbyte = uint8_t(((scales[ln_mbidx0] >> ln_mbidxshift0) & 0xF) | ((scales[1] >> ln_mbidxshift1) & 0x30));
+    return dm * FLOAT_TYPEV2(u8vec2(sc, mbyte));
+}
+
+void dual_iter(inout FLOAT_TYPE tg[NUM_COLS][NUM_ROWS], inout FLOAT_TYPE tu[NUM_COLS][NUM_ROWS], const uint i) {
+    const uint ao = i * LN_A_STEP;
+    const i32vec4 qg = LEAN_QS(data_a_raw32, ao);
+    const i32vec4 qu = LEAN_QS(data_a2_raw32, ao);
+    const vec2 dmg = lean_dm_scale(uvec3(data_a_raw32[ln_a0 + ao + 1], data_a_raw32[ln_a0 + ao + 2], data_a_raw32[ln_a0 + ao + 3]),
+                                   unpackHalf2x16(data_a_raw32[ln_a0 + ao]));
+    const vec2 dmu = lean_dm_scale(uvec3(data_a2_raw32[ln_a0 + ao + 1], data_a2_raw32[ln_a0 + ao + 2], data_a2_raw32[ln_a0 + ao + 3]),
+                                   unpackHalf2x16(data_a2_raw32[ln_a0 + ao]));
+
+    const uint bo = i * LN_B_STEP;
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        const vec2 ds = unpackHalf2x16(data_b_raw32[ln_bds[j] + bo]);
+        const int32_t b0 = int32_t(data_b_raw32[ln_bqs[j] + bo    ]);
+        const int32_t b1 = int32_t(data_b_raw32[ln_bqs[j] + bo + 1]);
+        const int32_t b2 = int32_t(data_b_raw32[ln_bqs[j] + bo + 2]);
+        const int32_t b3 = int32_t(data_b_raw32[ln_bqs[j] + bo + 3]);
+        int32_t sg = 0;
+        sg += dotPacked4x8EXT(qg.x, b0);
+        sg += dotPacked4x8EXT(qg.y, b1);
+        sg += dotPacked4x8EXT(qg.z, b2);
+        sg += dotPacked4x8EXT(qg.w, b3);
+        tg[j][0] += FLOAT_TYPE(float(ds.x) * float(dmg.x) * float(sg) - float(dmg.y) * float(ds.y / 2));
+        int32_t su = 0;
+        su += dotPacked4x8EXT(qu.x, b0);
+        su += dotPacked4x8EXT(qu.y, b1);
+        su += dotPacked4x8EXT(qu.z, b2);
+        su += dotPacked4x8EXT(qu.w, b3);
+        tu[j][0] += FLOAT_TYPE(float(ds.x) * float(dmu.x) * float(su) - float(dmu.y) * float(ds.y / 2));
+    }
+}
+#endif
+
+void lean_setup(const uint first_row);
+
+#if MMVQ_DUAL_GLU
+void dual_outputs(const uint first_row) {
+    const uint tid = gl_LocalInvocationID.x;
+    lean_setup(first_row);
+    const uint num_iters = p.ncols / (K_PER_ITER * BLOCK_SIZE);
+
+    FLOAT_TYPE tg[NUM_COLS][NUM_ROWS];
+    FLOAT_TYPE tu[NUM_COLS][NUM_ROWS];
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        tg[j][0] = FLOAT_TYPE(0.0f);
+        tu[j][0] = FLOAT_TYPE(0.0f);
+    }
+    uint i = 0;
+    for (; i + 4 <= num_iters; i += 4) {
+        dual_iter(tg, tu, i);
+        dual_iter(tg, tu, i + 1);
+        dual_iter(tg, tu, i + 2);
+        dual_iter(tg, tu, i + 3);
+    }
+    for (; i < num_iters; ++i) {
+        dual_iter(tg, tu, i);
+    }
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        const FLOAT_TYPE g = subgroupAdd(tg[j][0]);
+        const FLOAT_TYPE u = subgroupAdd(tu[j][0]);
+        if (tid == 0) {
+            data_d[j*p.batch_stride_d + d_offset + first_row] = D_TYPE(g / (1.0f + exp(-g)) * u);
+        }
+    }
+}
+#endif
+
+void lean_setup(const uint first_row) {
+    const uint tid = gl_LocalInvocationID.x;
+
+    get_offsets(a_offset, b_offset, d_offset);
+    a_offset *= QUANT_K / QUANT_K_Q8_1;
+    b_offset /= QUANT_K_Q8_1;
+
+    const uint b_qs_idx = tid % (32 / K_PER_ITER);
+    ln_iqs              = b_qs_idx * 4;
+
+    // q8_1-block index of this lane's first chunk; it advances by K_PER_ITER * BLOCK_SIZE / 32 per iteration, a
+    // multiple of 8, so the position inside the superblock is fixed
+    const uint ib_lane  = (first_row*p.ncols + tid * K_PER_ITER)/QUANT_K_Q8_1 + a_offset;
+    ln_a0               = (ib_lane / 8) * LN_A_DW;
+    const uint iqs_k    = (ib_lane % 8) * 8 + ln_iqs;
+    ln_aqs              = ln_a0 + LN_A_QS + (iqs_k / 16) * 8 + (iqs_k % 8);
+    ln_qs_shift         = ((iqs_k % 16) / 8) * 4;
+#if defined(DATA_A_Q5_K)
+    ln_aqh              = ln_a0 + LN_A_QH + ln_iqs;
+    ln_qh_shift         = iqs_k / 8;
+#endif
+    // get_dm_scale's selectors
+    const uint is         = iqs_k / 8;
+    const uint scalesoffs = (is & 3) * 8;
+    ln_scidx0             = (is < 4) ? 0 : 2;
+    ln_scidxshift0        = scalesoffs;
+    ln_scidxshift1        = (is < 4) ? scalesoffs : scalesoffs + 2;
+    ln_mbidx0             = (is < 4) ? 1 : 2;
+    ln_mbidxshift0        = (is < 4) ? scalesoffs : scalesoffs + 4;
+    ln_mbidxshift1        = (is < 4) ? scalesoffs : scalesoffs + 2;
+
+    // activations: dword index of the q8_1 block's ds and of this lane's four qs dwords, per column
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        const uint b_block_idx = (j*p.batch_stride_b + tid * K_PER_ITER) / QUANT_K_Q8_1 + b_offset;
+        const uint bx = (b_block_idx / 4) * LN_B_DW;
+        const uint bi = b_block_idx % 4;
+        ln_bds[j] = bx + bi;
+        ln_bqs[j] = bx + 4 + bi * 8 + ln_iqs;
+    }
+}
+
+void lean_outputs(const uint first_row) {
+    const uint tid = gl_LocalInvocationID.x;
+    lean_setup(first_row);
+    const uint num_iters = p.ncols / (K_PER_ITER * BLOCK_SIZE);
+
+    FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        temp[j][0] = FLOAT_TYPE(0.0f);
+    }
+
+    uint i = 0;
+    for (; i + 4 <= num_iters; i += 4) {
+        lean_iter(temp, i);
+        lean_iter(temp, i + 1);
+        lean_iter(temp, i + 2);
+        lean_iter(temp, i + 3);
+    }
+    for (; i < num_iters; ++i) {
+        lean_iter(temp, i);
+    }
+
+    reduce_result(temp, d_offset, first_row, 1, tid);
+}
+#endif
+
 void main() {
+#if MMVQ_DUAL_GLU
+    {
+        const uint dual_row = gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z;
+        if (dual_row < p.stride_d) {
+            dual_outputs(dual_row);
+        }
+        return;
+    }
+#endif
+#if !defined(MUL_MAT_ID) && (defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K))
+    if (PERSIST != 0 && p.ncols <= P_ITERS * K_PER_ITER * BLOCK_SIZE) {
+        persist_outputs();
+        return;
+    }
+    if (LEAN != 0 && NUM_ROWS == 1 && (p.ncols % (K_PER_ITER * BLOCK_SIZE)) == 0) {
+        const uint lean_row = gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z;
+        if (lean_row < p.stride_d) {
+            lean_outputs(lean_row);
+        }
+        return;
+    }
+#endif
     const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
 
 #ifdef NEEDS_INIT_IQ_SHMEM

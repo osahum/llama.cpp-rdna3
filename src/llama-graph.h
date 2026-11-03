@@ -253,6 +253,22 @@ public:
     const uint32_t n_outputs;
 };
 
+// llama-rdna: additive mask over the vocabulary, 0 for the first n_keep ids and -inf above (draft-head prefix vocabulary)
+class llm_graph_input_vocab_tail : public llm_graph_input_i {
+public:
+    llm_graph_input_vocab_tail(uint32_t n_vocab, uint32_t n_keep) : n_vocab(n_vocab), n_keep(n_keep) {}
+    virtual ~llm_graph_input_vocab_tail() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * mask; // F32 [n_vocab]
+
+    const uint32_t n_vocab;
+    const uint32_t n_keep;
+};
+
 class llm_graph_input_mean : public llm_graph_input_i {
 public:
     llm_graph_input_mean(const llama_cparams & cparams) : cparams(cparams) {}
@@ -1243,6 +1259,12 @@ struct llm_graph_context {
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
+
+    // llama-rdna: LM head of a draft (MTP) model over the first n_keep rows of head_w only (LLAMA_DRAFT_VOCAB_OUT=n_keep),
+    // logits padded to n_vocab with -inf, so the draft never proposes a token with id >= n_keep and needs no id remapping.
+    // With the variable unset or out of range it is the plain head mat-vec. Only valid when the vocabulary is ordered by
+    // frequency rank (BPE merge order), which is the case for this model: 99.85 percent of the target mass lies below id 98304.
+    ggml_tensor * build_draft_head(ggml_tensor * head_w, ggml_tensor * head_s, ggml_tensor * cur) const;
     ggml_tensor * build_inp_mean() const;
     ggml_tensor * build_inp_cls() const;
 

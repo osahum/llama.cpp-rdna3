@@ -1,0 +1,251 @@
+#version 450
+// llama-rdna: decode / speculative-verify attention for small query batches (1..8 tokens) over a q4_0, q8_0 or f16
+// KV cache with head size 256. One workgroup = (kv head, span of 32-key tiles). Its rows are all gqa query heads of
+// all tokens (rows = n_tok * gqa <= 48), so every K/V byte is read once per step instead of once per token. K and V
+// tiles are dequantized once into shared memory; scores and the PV product run on the VALU with f32 accumulation
+// across 4-element f16 dots; each span writes one split-K partial in the layout of flash_attn_split_k_reduce.comp,
+// which finishes the reduction. Structure after hipfire's attention_verify_wmma (Apache-2.0), see NOTICE.
+// Requires a subgroup size of 64: wave w (0..3) owns rows w + 4*j; lanes 0..31 and 32..63 work on two rows at once
+// during QK (lane = key within the tile) and on 4 dims each (lane*4) during PV.
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_clustered : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint KV_TYPE = 2;   // ggml_type: 1 = f16, 2 = q4_0, 8 = q8_0
+
+#define D 256
+#define D4 64
+#define BC 32
+#define MAX_ROWS 48
+#define NPAIR 6
+#define KS_STRIDE 65
+#define LOG2E 1.4426950408889634
+#define LN2 0.6931471805599453
+
+struct dec_blk_q4_0 { float16_t d; uint16_t qs[8]; };
+struct dec_blk_q8_0 { float16_t d; int16_t qs[16]; };
+
+layout (binding = 0) readonly buffer QB   { vec4 data_q4[]; };
+layout (binding = 1) readonly buffer KB40 { dec_blk_q4_0 data[]; } k_q4_0;
+layout (binding = 1) readonly buffer KB80 { dec_blk_q8_0 data[]; } k_q8_0;
+layout (binding = 1) readonly buffer KBF  { f16vec4 data[]; } k_f16;
+layout (binding = 2) readonly buffer VB40 { dec_blk_q4_0 data[]; } v_q4_0;
+layout (binding = 2) readonly buffer VB80 { dec_blk_q8_0 data[]; } v_q8_0;
+layout (binding = 2) readonly buffer VBF  { f16vec4 data[]; } v_f16;
+layout (binding = 3) readonly buffer MB   { float16_t data_m[]; };
+layout (binding = 4) writeonly buffer OB  { float data_o[]; };
+
+layout (push_constant) uniform parameter {
+    uint n_tok; uint n_head; uint gqa; uint n_kv; uint n_spans;
+    uint q_tok_stride; uint q_head_stride;   // floats
+    uint k_row_stride; uint k_head_stride;   // blocks (quant) or f16vec4 (f16)
+    uint v_row_stride; uint v_head_stride;
+    uint m_tok_stride;                       // halfs
+    float scale;
+} p;
+
+shared f16vec4 Ks[BC * KS_STRIDE];
+shared f16vec4 Vs[BC * D4];
+shared f16vec4 Qs[MAX_ROWS * D4];
+
+#define NEG_INF uintBitsToFloat(0xff800000u)
+
+// one 32-element block of K (idx in K-buffer units) -> 8 f16vec4 at Ks[dstb ..]
+void deq_k(const uint idx, const uint dstb, const bool valid) {
+    if (!valid) {
+        [[unroll]] for (uint q = 0; q < 8; ++q) { Ks[dstb + q] = f16vec4(0.0); }
+        return;
+    }
+    if (KV_TYPE == 2) {
+        const float d = float(k_q4_0.data[idx].d);
+        float v[32];
+        [[unroll]] for (uint i = 0; i < 8; ++i) {
+            const uint u = uint(k_q4_0.data[idx].qs[i]);
+            v[2*i]      = float(int( u        & 0xFu) - 8);
+            v[2*i + 1]  = float(int((u >>  8) & 0xFu) - 8);
+            v[2*i + 16] = float(int((u >>  4) & 0xFu) - 8);
+            v[2*i + 17] = float(int((u >> 12) & 0xFu) - 8);
+        }
+        [[unroll]] for (uint q = 0; q < 8; ++q) { Ks[dstb + q] = f16vec4(d * vec4(v[4*q], v[4*q+1], v[4*q+2], v[4*q+3])); }
+    } else if (KV_TYPE == 8) {
+        const float d = float(k_q8_0.data[idx].d);
+        float v[32];
+        [[unroll]] for (uint i = 0; i < 16; ++i) {
+            const int u = int(k_q8_0.data[idx].qs[i]);   // low byte = value 2i, high byte = value 2i+1 (both signed)
+            v[2*i]     = float((u << 24) >> 24);
+            v[2*i + 1] = float(u >> 8);
+        }
+        [[unroll]] for (uint q = 0; q < 8; ++q) { Ks[dstb + q] = f16vec4(d * vec4(v[4*q], v[4*q+1], v[4*q+2], v[4*q+3])); }
+    } else {
+        [[unroll]] for (uint q = 0; q < 8; ++q) { Ks[dstb + q] = k_f16.data[idx + q]; }
+    }
+}
+
+void deq_v(const uint idx, const uint dstb, const bool valid) {
+    if (!valid) {
+        [[unroll]] for (uint q = 0; q < 8; ++q) { Vs[dstb + q] = f16vec4(0.0); }
+        return;
+    }
+    if (KV_TYPE == 2) {
+        const float d = float(v_q4_0.data[idx].d);
+        float v[32];
+        [[unroll]] for (uint i = 0; i < 8; ++i) {
+            const uint u = uint(v_q4_0.data[idx].qs[i]);
+            v[2*i]      = float(int( u        & 0xFu) - 8);
+            v[2*i + 1]  = float(int((u >>  8) & 0xFu) - 8);
+            v[2*i + 16] = float(int((u >>  4) & 0xFu) - 8);
+            v[2*i + 17] = float(int((u >> 12) & 0xFu) - 8);
+        }
+        [[unroll]] for (uint q = 0; q < 8; ++q) { Vs[dstb + q] = f16vec4(d * vec4(v[4*q], v[4*q+1], v[4*q+2], v[4*q+3])); }
+    } else if (KV_TYPE == 8) {
+        const float d = float(v_q8_0.data[idx].d);
+        float v[32];
+        [[unroll]] for (uint i = 0; i < 16; ++i) {
+            const int u = int(v_q8_0.data[idx].qs[i]);
+            v[2*i]     = float((u << 24) >> 24);
+            v[2*i + 1] = float(u >> 8);
+        }
+        [[unroll]] for (uint q = 0; q < 8; ++q) { Vs[dstb + q] = f16vec4(d * vec4(v[4*q], v[4*q+1], v[4*q+2], v[4*q+3])); }
+    } else {
+        [[unroll]] for (uint q = 0; q < 8; ++q) { Vs[dstb + q] = v_f16.data[idx + q]; }
+    }
+}
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint wave = gl_SubgroupID;             // 0..3
+    const uint lane = gl_SubgroupInvocationID;   // 0..63
+    const uint hf = lane >> 5;
+    const uint c    = lane & 31;                 // key within the tile during QK
+    const uint g    = gl_WorkGroupID.x;          // kv head
+    const uint span = gl_WorkGroupID.y;
+    const uint R    = p.n_tok * p.gqa;
+    const uint n_spans = p.n_spans;
+    const uint total_tiles = (p.n_kv + BC - 1) / BC;
+    const float scale_log2 = p.scale * LOG2E;
+
+    // Q rows (token-major, then head within the kv group) -> shared as f16
+    for (uint idx = tid; idx < R * D4; idx += 256) {
+        const uint r = idx / D4;
+        const uint q = idx % D4;
+        const uint tok  = r / p.gqa;
+        const uint head = g * p.gqa + r % p.gqa;
+        Qs[idx] = f16vec4(data_q4[(tok * p.q_tok_stride + head * p.q_head_stride) / 4 + q]);
+    }
+
+    float m_run[NPAIR];
+    float l_run[NPAIR];
+    vec4  O[2 * NPAIR];
+    [[unroll]] for (uint i = 0; i < NPAIR; ++i) {
+        m_run[i] = NEG_INF;
+        l_run[i] = 0.0;
+        O[2*i] = vec4(0.0);
+        O[2*i + 1] = vec4(0.0);
+    }
+
+    barrier();
+
+    for (uint t = span; t < total_tiles; t += n_spans) {
+        const uint key0 = t * BC;
+
+        // ---- K/V tile -> shared (thread = one 32-element block of one key) ----
+        {
+            const uint kc = tid >> 3;
+            const uint b  = tid & 7;
+            const uint kk = key0 + kc;
+            const bool valid = kk < p.n_kv;
+            const uint kkc = valid ? kk : 0u;
+            if (KV_TYPE == 1) {
+                deq_k(kkc * p.k_row_stride + g * p.k_head_stride + 8 * b, kc * KS_STRIDE + 8 * b, valid);
+                deq_v(kkc * p.v_row_stride + g * p.v_head_stride + 8 * b, kc * D4 + 8 * b, valid);
+            } else {
+                deq_k(kkc * p.k_row_stride + g * p.k_head_stride + b, kc * KS_STRIDE + 8 * b, valid);
+                deq_v(kkc * p.v_row_stride + g * p.v_head_stride + b, kc * D4 + 8 * b, valid);
+            }
+        }
+        barrier();
+
+        // ---- scores: lane = key c, rows w + 4*(2i + hf) ----
+        const uint kk = key0 + c;
+        const bool key_ok = kk < p.n_kv;
+        float acc[NPAIR];
+        [[unroll]] for (uint i = 0; i < NPAIR; ++i) { acc[i] = 0.0; }
+        for (uint q0 = 0; q0 < D4; q0 += 8) {
+            f16vec4 kreg[8];
+            [[unroll]] for (uint j = 0; j < 8; ++j) { kreg[j] = Ks[c * KS_STRIDE + q0 + j]; }
+            [[unroll]] for (uint i = 0; i < NPAIR; ++i) {
+                const uint r = wave + 4 * (2 * i + hf);
+                if (r < R) {
+                    float a = acc[i];
+                    [[unroll]] for (uint j = 0; j < 8; ++j) { a += float(dot(Qs[r * D4 + q0 + j], kreg[j])); }
+                    acc[i] = a;
+                }
+            }
+        }
+        float p_cur[NPAIR];
+        float a_cur[NPAIR];
+        [[unroll]] for (uint i = 0; i < NPAIR; ++i) {
+            const uint r = wave + 4 * (2 * i + hf);
+            float s = NEG_INF;
+            if (r < R && key_ok) {
+                const uint tok = r / p.gqa;
+                const float mv = float(data_m[tok * p.m_tok_stride + kk]);
+                s = acc[i] * scale_log2 + mv * LOG2E;
+            }
+            const float mx    = subgroupClusteredMax(s, 32);
+            const float m_new = max(m_run[i], mx);
+            float alpha = 1.0;
+            float pv    = 0.0;
+            if (m_new != NEG_INF) {
+                alpha = exp2(m_run[i] - m_new);   // m_run == -inf -> 0
+                pv    = exp2(s - m_new);          // s == -inf -> 0
+            }
+            const float psum = subgroupClusteredAdd(pv, 32);
+            l_run[i] = l_run[i] * alpha + psum;
+            m_run[i] = m_new;
+            p_cur[i] = pv;
+            a_cur[i] = alpha;
+        }
+
+        // ---- PV: lane owns dims 4*lane .. 4*lane+3 of every row of this wave ----
+        [[unroll]] for (uint i = 0; i < NPAIR; ++i) {
+            O[2*i]     *= subgroupShuffle(a_cur[i], 0);
+            O[2*i + 1] *= subgroupShuffle(a_cur[i], 32);
+        }
+        [[unroll]] for (uint cc = 0; cc < BC; ++cc) {
+            const vec4 v = vec4(Vs[cc * D4 + lane]);
+            [[unroll]] for (uint i = 0; i < NPAIR; ++i) {
+                O[2*i]     += subgroupShuffle(p_cur[i], cc) * v;
+                O[2*i + 1] += subgroupShuffle(p_cur[i], 32 + cc) * v;
+            }
+        }
+        barrier();   // the next tile overwrites Ks / Vs
+    }
+
+    // ---- partials: O (unnormalized), L and M (natural-log domain) per (span, token, head) ----
+    [[unroll]] for (uint i = 0; i < NPAIR; ++i) {
+        [[unroll]] for (uint h = 0; h < 2; ++h) {
+            const uint r = wave + 4 * (2 * i + h);
+            if (r < R) {
+                const uint tok  = r / p.gqa;
+                const uint head = g * p.gqa + r % p.gqa;
+                const uint o_base = D * p.n_head * (span + n_spans * tok) + D * head + 4 * lane;
+                const vec4 o = (h == 0) ? O[2*i] : O[2*i + 1];
+                data_o[o_base + 0] = o.x;
+                data_o[o_base + 1] = o.y;
+                data_o[o_base + 2] = o.z;
+                data_o[o_base + 3] = o.w;
+                if (lane == 32 * h) {
+                    const uint lm = D * p.n_head * p.n_tok * n_spans + p.n_head * 2 * (span + n_spans * tok) + head;
+                    data_o[lm] = l_run[i];
+                    data_o[lm + p.n_head] = m_run[i] * LN2;
+                }
+            }
+        }
+    }
+}

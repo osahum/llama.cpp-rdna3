@@ -4082,6 +4082,137 @@ struct test_rms_norm_mul_add : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM + GGML_OP_SCALE, the l2 norm of the GDN q/k (build_gdn_l2_norm); the Vulkan backend fuses the pair
+struct test_rms_norm_scale : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_SCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, eps);
+    }
+
+    test_rms_norm_scale(std::array<int64_t, 4> ne = {128, 16, 4, 1}, float eps = 1e-6f)
+        : ne(ne), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+        // a view, as in the model (q and k are views of the conv output)
+        ggml_tensor * v = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], 0);
+        const float n = ne[0];
+        ggml_tensor * out = ggml_scale(ctx, ggml_rms_norm(ctx, v, eps/n), 1.0f/sqrtf(n));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+};
+
+// GGML_OP_RMS_NORM + GGML_OP_MUL (weight) + GGML_OP_MUL (gate), the GDN output gate (build_norm_gated); the Vulkan backend
+// fuses the three when they are consecutive (gate_first puts the gate's SILU ahead of the norm in the graph order)
+struct test_rms_norm_mul_mul : public test_case {
+    const std::array<int64_t, 4> ne;
+    const bool gate_first;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, gate_first);
+    }
+
+    test_rms_norm_mul_mul(std::array<int64_t, 4> ne = {128, 48, 4, 1}, bool gate_first = true)
+        : ne(ne), gate_first(gate_first) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_tensor * z = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_param(a); ggml_set_name(a, "a");
+        ggml_set_param(w); ggml_set_name(w, "w");
+        ggml_set_param(z); ggml_set_name(z, "z");
+        ggml_tensor * g = ggml_silu(ctx, z);
+        ggml_tensor * n = ggml_mul(ctx, ggml_rms_norm(ctx, a, 1e-6f), w);
+        ggml_tensor * out = gate_first ? ggml_mul(ctx, g, n) : ggml_mul(ctx, n, g);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+};
+
+// GGML_OP_RMS_NORM + GGML_OP_MUL feeding quantized mat-vecs (the Vulkan backend may emit the q8_1 activations from the norm)
+struct test_rms_norm_mul_matvec_q8 : public test_case {
+    const ggml_type type_w;
+    const int64_t k;
+    const int64_t m;
+    const int64_t n;
+    const bool two_consumers;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_Q8";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_w, k, m, n, two_consumers);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_rms_norm_mul_matvec_q8(ggml_type type_w = GGML_TYPE_Q4_K, int64_t k = 1280, int64_t m = 256, int64_t n = 4, bool two_consumers = false)
+        : type_w(type_w), k(k), m(m), n(n), two_consumers(two_consumers) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+        ggml_tensor * g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+        ggml_set_name(g, "g");
+        ggml_tensor * w1 = ggml_new_tensor_2d(ctx, type_w, k, m);
+        ggml_set_name(w1, "w1");
+        ggml_tensor * h = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), g);
+        ggml_set_name(h, "h");
+        ggml_tensor * out = ggml_mul_mat(ctx, w1, h);
+        if (two_consumers) {
+            ggml_tensor * w2 = ggml_new_tensor_2d(ctx, type_w, k, m);
+            ggml_set_name(w2, "w2");
+            out = ggml_add(ctx, out, ggml_mul_mat(ctx, w2, h));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -1.0f, 1.0f);
+        }
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_ADD (fused residual chain)
 struct test_add_add : public test_case {
     const ggml_type type;
@@ -10969,6 +11100,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm    (GGML_TYPE_F32, {4, 1, 1, 65536}, false, 1e-6f, false));
     test_cases.emplace_back(new test_l2_norm     (GGML_TYPE_F32, {4, 1, 65536, 1}, 1e-12f, false, false));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {4, 1, 65536, 1}, 1e-6f, false, false));
+    for (auto ne : std::vector<std::array<int64_t, 4>>{ {128, 16, 4, 1}, {128, 16, 1, 1}, {128, 16, 64, 1}, {64, 3, 5, 2}, {300, 7, 2, 1} }) {
+        test_cases.emplace_back(new test_rms_norm_scale(ne, 1e-6f));
+    }
+    for (auto ne : std::vector<std::array<int64_t, 4>>{ {128, 48, 4, 1}, {128, 48, 1, 1}, {128, 48, 64, 1}, {256, 3, 5, 2} }) {
+        test_cases.emplace_back(new test_rms_norm_mul_mul(ne, true));
+        test_cases.emplace_back(new test_rms_norm_mul_mul(ne, false));
+    }
 
     for (uint32_t n : {1, 127, 129, 511, 513, 2816, 4096, 16385}) {
         test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {n, 3, 2, 1}));
@@ -11010,6 +11148,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F32, { n, 5, 4, 3 }, false, false));
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F32, { n, 5, 4, 3 }, true, false));
     }
+
+    // rms_norm + mul feeding q8_1 mat-vecs (Vulkan RMS_NORM_MUL_Q8 fusion): one and two consumers, 1 and 4 rows
+    for (ggml_type type_w : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_0}) {
+        for (int64_t n : {1, 4}) {
+            test_cases.emplace_back(new test_rms_norm_mul_matvec_q8(type_w, 1280, 256, n, false));
+            test_cases.emplace_back(new test_rms_norm_mul_matvec_q8(type_w, 1280, 256, n, true));
+        }
+    }
+    test_cases.emplace_back(new test_rms_norm_mul_matvec_q8(GGML_TYPE_Q4_K, 5120, 512, 4, true));
+    test_cases.emplace_back(new test_rms_norm_mul_matvec_q8(GGML_TYPE_Q6_K, 1280, 256, 4, false));
 
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, true));
@@ -12235,6 +12383,37 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
+    // llama-rdna: prefill GEMM shapes large enough for the large int8 cooperative-matrix tile (128 x 128), including the
+    // requantized q4_K / q5_K / q6_K shaders (CM1_REQ) and partial tiles in both dimensions
+    for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
+        for (int m : { 512, 576 }) {
+            for (int n : { 64, 300, 512 }) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, 2048, {1, 1}, {1, 1}));
+            }
+        }
+    }
+    // llama-rdna: Qwen3.8-27B attention layers (24 q heads over 4 kv heads, head_dim 256) in decode and MTP verify shapes
+    // prefill shapes (more than 8 tokens): the cm shader in blocks of 8 tokens, including a partial last block
+    for (int kv : { 512, 1024 }) {
+        for (int nb : { 9, 16, 37, 64 }) {
+            for (ggml_type type_KV : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            }
+        }
+    }
+    for (int kv : { 256, 8192 }) {
+        for (int nb : { 1, 4, 8 }) {
+            for (ggml_type type_KV : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            }
+        }
+    }
+    // the other token counts of the wave32 decode shader's query-tile variants (12 / 18 / 30 / 36 / 42 rows), and 32-key tails
+    for (int kv : { 96, 4096 }) {
+        for (int nb : { 2, 3, 5, 6, 7 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, true, true, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -12433,6 +12612,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
+    }
+
+    // llama-rdna: q4_K gate/up + SwiGLU in one Vulkan mat-vec (MUL_MAT_DUAL_GLU): 1-8 columns, K a multiple of 1024,
+    // no batch dims; the K=5120 / 17408-row shape of Qwen3.8's FFN included
+    for (int64_t cols : {1, 2, 3, 4, 5, 6, 8}) {
+        for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ {256, 1024}, {640, 2048}, {17408, 5120} }) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, cols, mk.first, mk.second,
+                false, 1, 1, false, false, true, false, {1, 1}));
+        }
     }
 
     // Gate and up on the SYCL XMX kernels: rows long enough for 2D block loads, a last tile of 8 rows, and

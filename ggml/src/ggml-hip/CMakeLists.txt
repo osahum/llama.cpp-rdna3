@@ -101,6 +101,32 @@ if (GGML_HIP_GRAPHS)
     add_compile_definitions(GGML_HIP_GRAPHS)
 endif()
 
+# llama-rdna: per-file tuning knobs for the RDNA3 multi-column GEMV (only mmvq.cu recompiles when they change)
+set(_llama_rdna_mmvq_defs "")
+if (GGML_RDNA3_MMVQ_NWARPS)
+    list(APPEND _llama_rdna_mmvq_defs "GGML_RDNA3_MMVQ_NWARPS=${GGML_RDNA3_MMVQ_NWARPS}")
+endif()
+if (GGML_RDNA3_MMVQ_ROWS)
+    list(APPEND _llama_rdna_mmvq_defs "GGML_RDNA3_MMVQ_ROWS=${GGML_RDNA3_MMVQ_ROWS}")
+endif()
+if (_llama_rdna_mmvq_defs)
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda/mmvq.cu PROPERTIES COMPILE_DEFINITIONS "${_llama_rdna_mmvq_defs}")
+endif()
+
+# llama-rdna: tile-config knobs for the RDNA3 large-batch K-quant MMQ (mmq.cu and the Q4_K/Q5_K/Q6_K instances recompile)
+set(_llama_rdna_mmq_defs "")
+if (GGML_RDNA3_MMQ_NTHREADS AND GGML_RDNA3_MMQ_OCC AND GGML_RDNA3_MMQ_I)
+    list(APPEND _llama_rdna_mmq_defs "GGML_RDNA3_MMQ_NTHREADS=${GGML_RDNA3_MMQ_NTHREADS}" "GGML_RDNA3_MMQ_OCC=${GGML_RDNA3_MMQ_OCC}" "GGML_RDNA3_MMQ_I=${GGML_RDNA3_MMQ_I}")
+endif()
+if (_llama_rdna_mmq_defs)
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda/mmq.cu
+        ${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda/template-instances/mmq-instance-q4_k.cu
+        ${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda/template-instances/mmq-instance-q5_k.cu
+        ${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda/template-instances/mmq-instance-q6_k.cu
+        PROPERTIES COMPILE_DEFINITIONS "${_llama_rdna_mmq_defs}")
+endif()
+
 if (GGML_HIP_NO_VMM)
     add_compile_definitions(GGML_HIP_NO_VMM)
 endif()

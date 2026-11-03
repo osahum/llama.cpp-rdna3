@@ -1,0 +1,540 @@
+#version 450
+// llama-rdna: decode / speculative-verify attention on RDNA3 wave32 for 1..8 query tokens over a q4_0 KV cache with head
+// size 256 (R = n_tok * gqa <= 16 * QT query rows, token-major then head). Structure after hipfire's
+// attention_verify_wmma.gfx1100.hip (Apache-2.0, see NOTICE), written for KHR_cooperative_matrix and q4_0:
+//  * one workgroup = (kv head g, span of 32-key tiles span, span + n_spans, ...), 4 * QT subgroups of 32 lanes;
+//  * subgroup w = (qt = w >> 2, ks = (w >> 1) & 1, d = w & 1): query tile qt (rows 16 qt ..), key half ks of every tile
+//    (its own online-softmax stream), dim half d (dims 128 d ..);
+//  * QK: S^T[16 keys x 16 rows] = K . Q^T over the subgroup's 128 dims, its 8 Q^T fragments held in registers for the
+//    whole loop; the two dim halves exchange their partial S^T once per tile through shared memory and add them (the
+//    sum is the same in both);
+//  * softmax in registers on the S^T accumulator (RDNA3 layout, see flash_attn_pf.comp: lane l holds column l % 16 =
+//    query row, rows 2 e + l / 16 = keys), lazy running max (it only moves when a tile exceeds it by THRESH log2 units,
+//    so P <= 2^THRESH fits f16); every element of a lane belongs to one query row, so rescaling O is per lane;
+//  * PV: O^T[16 dims x 16 rows] += V^T[16 dims x 16 keys] . P^T for the subgroup's 128 dims, 8 accumulators in
+//    registers; P^T reaches its operand layout through a subgroup-private shared-memory round trip;
+//  * the K plane (f16 [key][256 dims]) and V^T plane (f16 [dim][32 keys]) are filled once per tile by subgroups 0..7
+//    (lane = key, subgroup = block) from q4_0 blocks fetched a tile ahead into registers (the 5 dwords covering an
+//    18-byte block, realigned at the fill so the fetch stays in flight); single-buffered and filled in alternating
+//    phases (V(t) beside QK(t), K(t+1) beside PV(t)), two barriers per tile;
+//  * each key-half stream writes its own split-K partial (span 2 span + ks: O unnormalized, L, M in natural log),
+//    merged with the others by flash_attn_split_k_reduce.comp.
+// Prompt mode (PF = 1, more than 8 tokens): workgroup z takes the block of tok_blk = 48 / gqa tokens from z (the last
+// block first, it has the most live keys); the mask pre-pass also finds the last tile with a mask value above -inf for
+// any token of the block, and later tiles (the causal tail of the batch, the cache padding) are not computed, since they
+// add exactly 0; at the end the two key-half streams are merged in the workgroup, and the result goes straight to dst
+// normalized (one span) or as one split-K partial per span.
+// Keys past n_kv are fetched as the last row and masked to -inf, so they add exactly 0.
+// Dims are stored in slot order: within every group of four, slots 1 and 2 hold dims 2 and 1 (the order the cheap q4_0
+// unpacking produces); Q is staged in the same order, so S is unchanged, and O is written back in dim order.
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_cooperative_matrix : enable
+
+#ifndef QT
+#define QT 2                // 16-row query tiles: 1 (<= 16 rows), 2 (<= 32), 3 (<= 48)
+#endif
+#define NW (4 * QT)         // subgroups of 32 lanes
+#define NTH (32 * NW)
+layout(local_size_x = NTH, local_size_y = 1, local_size_z = 1) in;
+
+#define D 256
+#define KT 32               // keys per tile
+#define THRESH 8.0
+#define LOG2E 1.4426950408889634
+#define LN2 0.6931471805599453
+#define NEG_INF uintBitsToFloat(0xff800000u)
+
+#define KROW 66             // K plane, one key per row: 64 f16vec4 (256 dims) + 2 pad (132 dwords: conflict-free reads)
+#define VROW 20             // V^T plane, one dim per row: 16 f16vec2 (32 keys) + 4 pad (20 dwords: conflict-free reads)
+#define PSTR 6              // P^T staging, one query column per 6 f16vec4 (16 keys + 8 pad halfs)
+#define FU ((QT == 1) ? 2 : 1)   // fill units (one q4_0 block of K and one of V) per thread per tile
+// 1: P^T is built in registers from the S^T accumulator (RDNA3 operand layout: B element k of lane l is row k, column
+// l % 16); 0: through a subgroup-private shared-memory round trip (layout-free). GGML_VK_FA_DEC_W_PT=0 selects 0.
+layout(constant_id = 0) const uint PT_REG = 1;
+// 1: the V^T fill stores single halves (one per slot); 0: it pairs keys across lanes and stores dwords (same contents).
+// GGML_VK_FA_DEC_W_VT=0 selects 0.
+layout(constant_id = 1) const uint VT_HALF = 1;
+// 1: a tile whose 16 mask values are all zero for every lane of the subgroup skips the mask arithmetic (same scores, since
+// adding a zero mask term changes nothing); 0: always applied. GGML_VK_FA_DEC_W_MASKFAST=0 selects 0.
+layout(constant_id = 2) const uint MASK_FAST = 1;
+// timing-only switches (GGML_VK_FA_DEC_W_PROF, default 0); any nonzero value gives wrong results
+layout(constant_id = 3) const uint PROF = 0;
+// 1: before the loop the workgroup marks the tiles whose mask has a nonzero value for any of its tokens, and only those
+// fetch the mask (decode masks are zero up to the newest keys); 0: every tile fetches it a tile ahead. Same scores either
+// way. GGML_VK_FA_DEC_W_MFLAGS=0 selects 0.
+layout(constant_id = 4) const uint MFLAGS = 1;
+// 1: the fragment loads of the QK and PV phases go in two batches of four (fewer registers live at once); 0: one batch.
+// GGML_VK_FA_DEC_W_BATCH=0 selects 0.
+layout(constant_id = 5) const uint FRAG_BATCH = 1;
+// 1: prompt mode (see above), 0: decode. Prompt mode always marks the tiles with a nonzero mask, for up to 32 MFW tiles
+// per workgroup (later ones fetch their mask when they reach it).
+layout(constant_id = 6) const uint PF = 0;
+const bool MF = (MFLAGS | PF) != 0u;
+const uint MFW = 8u + 248u * PF;   // mask flag words: 256 tiles in decode, 8192 in prompt mode (PF is 0 or 1)
+#define P_NOFETCH 1u    // no K / V fetches inside the tile loop
+#define P_NOFILL  2u    // no K / V plane fills inside the tile loop (the fetched words go to a sink)
+#define P_NOQK    4u    // no QK fragment loads and products
+#define P_NOPV    8u    // no PV fragment loads and products
+#define P_NOSM   16u    // no softmax (P = 0, no rescale)
+#define P_NOSX   32u    // no S^T exchange between the dim halves
+#define P_NOBAR  64u    // no barriers inside the tile loop
+#define P_NOMASK 128u   // no mask fetches inside the tile loop
+
+#define ACC   coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define ACC16 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define MATA  coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MATB  coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+
+layout (binding = 0) readonly buffer QB  { vec4 data_q4[]; };
+layout (binding = 1) readonly buffer KB  { uint data[]; } k_w;   // q4_0 blocks (18 bytes), read as dwords
+layout (binding = 2) readonly buffer VB  { uint data[]; } v_w;
+layout (binding = 3) readonly buffer MB4 { uvec4 data_m4[]; };   // mask as 8 packed halfs per element
+layout (binding = 4) writeonly buffer OB { float data_o[]; };
+
+layout (push_constant) uniform parameter {
+    uint n_tok; uint n_head; uint gqa; uint n_kv; uint n_spans;
+    uint q_tok_stride; uint q_head_stride;   // floats
+    uint k_row_stride; uint k_head_stride;   // blocks
+    uint v_row_stride; uint v_head_stride;
+    uint m_tok_stride;                       // halfs, multiple of 8
+    float scale;
+    uint tok_blk;                            // prompt mode: tokens per workgroup (48 / gqa); unused in decode
+} p;
+
+shared f16vec4 Kpl[KT * KROW];          // 16,896 B: K of the current tile; Q rows 0..31 before the loop
+shared f16vec2 Vpl[D * VROW];           // 20,480 B: V^T of the current tile; Q rows 32..47 before the loop
+shared vec4    Sx[NW * 64];             // NW KB: each subgroup's partial S^T, 2 vec4 per lane; prompt mode: the merge
+shared f16vec4 Pst[NW * 16 * PSTR];     // NW x 768 B: each subgroup's P^T
+shared uint    mflags[MFW];             // bit i: tile i of this workgroup has a nonzero mask value
+shared uint    n_live_sh;               // prompt mode: 1 + the last tile with a mask value above -inf
+
+// ---- q4_0 fetch: the 5 dwords that cover block bi (from its byte offset rounded down to a dword; an odd index starts 2
+//      bytes in, an even one never reads past its key's head row), realigned only when the block is dequantized ----
+struct raw_q4 { uvec4 a; uint b; uint odd; };
+
+raw_q4 fetch_k(const uint bi) {
+    const uint w0 = (bi * 9u) >> 1;
+    raw_q4 r;
+    r.a = uvec4(k_w.data[w0], k_w.data[w0 + 1u], k_w.data[w0 + 2u], k_w.data[w0 + 3u]);
+    r.b = k_w.data[w0 + 4u];
+    r.odd = bi & 1u;
+    return r;
+}
+raw_q4 fetch_v(const uint bi) {
+    const uint w0 = (bi * 9u) >> 1;
+    raw_q4 r;
+    r.a = uvec4(v_w.data[w0], v_w.data[w0 + 1u], v_w.data[w0 + 2u], v_w.data[w0 + 3u]);
+    r.b = v_w.data[w0 + 4u];
+    r.odd = bi & 1u;
+    return r;
+}
+
+// the 32 values of a fetched block as 8 f16vec4 in slot order: v[i] holds dims 4 i, 4 i + 2, 4 i + 1, 4 i + 3 and v[4 + i]
+// dims 16 + 4 i, 16 + 4 i + 2, 16 + 4 i + 1, 16 + 4 i + 3 (byte b of the codes holds value b in its low nibble and b + 16
+// in its high nibble). Two nibbles that sit 16 bits apart become one packed f16 pair with a single and-or: 0x6400 | n is
+// the f16 1024 + n exactly, so subtracting 1032 gives n - 8 exactly and one packed multiply applies d (rounded once).
+void q4_deq(const raw_q4 r, out f16vec4 v[8]) {
+    const bool  odd = r.odd != 0u;
+    const uvec4 nxt = uvec4(r.a.yzw, r.b);
+    const uvec4 qs  = odd ? nxt : ((r.a >> 16) | (nxt << 16));   // code bytes 4 i .. 4 i + 3 in qs[i]
+    const f16vec2 dd = unpackFloat2x16(r.a.x);
+    const f16vec2 d2 = f16vec2(odd ? dd.y : dd.x);
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        const uint w = qs[i];
+        const f16vec2 x0 = (unpackFloat2x16((w         & 0x000F000Fu) | 0x64006400u) - f16vec2(1032.0)) * d2;   // dims 4i, 4i+2
+        const f16vec2 x1 = (unpackFloat2x16(((w >> 8)  & 0x000F000Fu) | 0x64006400u) - f16vec2(1032.0)) * d2;   // 4i+1, 4i+3
+        const f16vec2 x2 = (unpackFloat2x16(((w >> 4)  & 0x000F000Fu) | 0x64006400u) - f16vec2(1032.0)) * d2;   // 16+4i, 16+4i+2
+        const f16vec2 x3 = (unpackFloat2x16(((w >> 12) & 0x000F000Fu) | 0x64006400u) - f16vec2(1032.0)) * d2;   // 16+4i+1, 16+4i+3
+        v[i]      = f16vec4(x0, x1);
+        v[4u + i] = f16vec4(x2, x3);
+    }
+}
+
+// block fb (dims 32 fb ..) of key kr -> row kr of the K plane
+void fill_k(const raw_q4 r, const uint kr, const uint fb) {
+    f16vec4 v[8];
+    q4_deq(r, v);
+    [[unroll]] for (uint i = 0; i < 8; ++i) { Kpl[kr * KROW + 8u * fb + i] = v[i]; }
+}
+
+// block fb of key kr -> column kr of rows (slots) 32 fb .. 32 fb + 31 of the V^T plane. Lane kr ^ 1 holds key kr ^ 1 of the
+// same block, so each lane writes whole dwords (two keys of one slot): the even key the even slots, the odd key the odd ones.
+void fill_v(const raw_q4 r, const uint kr, const uint fb) {
+    f16vec4 v[8];
+    q4_deq(r, v);
+    if (VT_HALF != 0u) {   // slot 4 i + c of v[i] (i < 4) or 16 + 4 (i - 4) + c (i >= 4): one half per slot, key kr
+        [[unroll]] for (uint i = 0; i < 8; ++i) {
+            const uint s0 = 32u * fb + ((i < 4u) ? 4u * i : 16u + 4u * (i - 4u));
+            [[unroll]] for (uint c = 0; c < 4; ++c) { Vpl[(s0 + c) * VROW + (kr >> 1)][kr & 1u] = v[i][c]; }
+        }
+        return;
+    }
+    const bool odd_key = (kr & 1u) != 0u;
+    [[unroll]] for (uint j = 0; j < 16; ++j) {   // slots 2 j, 2 j + 1 of the block
+        const uint own = packFloat2x16(((j & 1u) == 0u) ? v[j >> 1].xy : v[j >> 1].zw);
+        const uint oth = subgroupShuffleXor(own, 1u);
+        const uint pair = odd_key ? ((oth >> 16) | (own & 0xFFFF0000u)) : ((own & 0xFFFFu) | (oth << 16));
+        Vpl[(32u * fb + 2u * j + (odd_key ? 1u : 0u)) * VROW + (kr >> 1)] = unpackFloat2x16(pair);
+    }
+}
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint w    = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;   // 0..31
+    const uint g    = gl_WorkGroupID.x;          // kv head
+    const uint span = gl_WorkGroupID.y;
+    const uint n_spans = p.n_spans;
+    // prompt mode: tokens t0 .. t0 + ntb - 1, the last block first
+    const uint t0  = (PF != 0u) ? (gl_NumWorkGroups.z - 1u - gl_WorkGroupID.z) * p.tok_blk : 0u;
+    const uint ntb = (PF != 0u) ? min(p.tok_blk, p.n_tok - t0) : p.n_tok;
+    const uint R = ntb * p.gqa;
+    const uint total_tiles = (p.n_kv + KT - 1u) / KT;
+    const uint n_my = (total_tiles - span + n_spans - 1u) / n_spans;   // the host keeps n_spans <= total_tiles
+    const float scale_log2 = p.scale * LOG2E;
+
+    const uint d  = w & 1u;
+    const uint ks = (w >> 1) & 1u;
+    const uint qt = w >> 2;
+    const uint qc = lane & 15u;        // query column of this lane in S^T and O^T
+    const uint hf = lane >> 4;         // its rows there: 2 e + hf
+    const uint qi = 16u * qt + qc;
+    const bool qok = qi < R;
+    const uint tok  = t0 + (qok ? qi / p.gqa : 0u);
+    const uint head = g * p.gqa + (qok ? qi % p.gqa : 0u);
+
+    // ---- fill roles: lane = key of the tile, block fb = w (+ 4 for the second unit when QT == 1); subgroups 8.. do not fill ----
+    const bool filler = w < 8u;
+#define FB(u) (w + 4u * (u))
+    raw_q4 rk[FU], rv[FU];
+    if (filler) {
+        const uint kk = min(span * KT + lane, p.n_kv - 1u);
+        [[unroll]] for (uint u = 0; u < FU; ++u) {
+            rk[u] = fetch_k(kk * p.k_row_stride + g * p.k_head_stride + FB(u));
+            rv[u] = fetch_v(kk * p.v_row_stride + g * p.v_head_stride + FB(u));
+        }
+    }
+
+    // ---- Q rows -> f16 in slot order (rows 0..31 in the K plane, 32..47 in the V^T plane) -> this subgroup's 8 Q^T
+    //      fragments; each thread fetches its 8 vec4 before storing any, so the loads overlap ----
+    vec4 qv[8];
+    [[unroll]] for (uint k = 0; k < 8; ++k) {
+        const uint idx = tid + k * NTH;               // 8 * NTH = 16 QT rows of 64 vec4
+        const uint r   = min(idx / (D / 4u), R - 1u);
+        const uint tq  = t0 + r / p.gqa;
+        const uint hq  = g * p.gqa + r % p.gqa;
+        qv[k] = data_q4[(tq * p.q_tok_stride + hq * p.q_head_stride) / 4u + idx % (D / 4u)];
+    }
+    [[unroll]] for (uint k = 0; k < 8; ++k) {
+        const uint idx = tid + k * NTH;
+        const uint r   = idx / (D / 4u);
+        const uint c4  = idx % (D / 4u);
+        const f16vec4 val = (r < R) ? f16vec4(qv[k].xzyw) : f16vec4(0.0);
+        if (r < 32u) {
+            Kpl[r * KROW + c4] = val;
+        } else {
+            Vpl[(r - 32u) * (2u * KROW) + 2u * c4]      = val.xy;
+            Vpl[(r - 32u) * (2u * KROW) + 2u * c4 + 1u] = val.zw;
+        }
+    }
+    barrier();
+    MATB qf[8];
+    [[unroll]] for (uint c = 0; c < 8; ++c) {
+        if (qt < 2u) {
+            coopMatLoad(qf[c], Kpl, (16u * qt) * KROW + 32u * d + 4u * c, KROW, gl_CooperativeMatrixLayoutColumnMajor);
+        } else {
+            coopMatLoad(qf[c], Vpl, 2u * (32u * d + 4u * c), 2u * KROW, gl_CooperativeMatrixLayoutColumnMajor);
+        }
+    }
+    barrier();   // every subgroup has its Q^T fragments before the planes are overwritten
+
+    if (filler) {
+        [[unroll]] for (uint u = 0; u < FU; ++u) { fill_k(rk[u], lane, FB(u)); }
+        if (n_my > 1u) {
+            const uint kk = min((span + n_spans) * KT + lane, p.n_kv - 1u);
+            [[unroll]] for (uint u = 0; u < FU; ++u) { rk[u] = fetch_k(kk * p.k_row_stride + g * p.k_head_stride + FB(u)); }
+        }
+    }
+    barrier();
+
+    // this lane's 16 mask values of the first tile; later tiles' are fetched a tile ahead (!MF), or only for the tiles
+    // marked below (MF)
+    uvec4 mm0 = uvec4(0u), mm1 = uvec4(0u);
+    uint n_live = n_my;   // tiles computed
+    if (!MF) {
+        mm0 = data_m4[(tok * p.m_tok_stride + span * KT + 16u * ks) / 8u];
+        mm1 = data_m4[(tok * p.m_tok_stride + span * KT + 16u * ks) / 8u + 1u];
+    } else if (PF != 0u) {
+        // prompt mode: 8 uvec4 per thread in flight, token by token, over the first nft tiles; also the last tile with a
+        // value above -inf (0xFC00 in f16) for any token
+        for (uint k = tid; k < MFW; k += NTH) { mflags[k] = 0u; }
+        if (tid == 0u) { n_live_sh = 0u; }
+        barrier();
+        const uint nft = min(n_my, 32u * MFW);
+        const uint nq  = 4u * nft;
+        uint last = 0u;
+        for (uint t = 0; t < ntb; ++t) {
+            const uint mrow = (t0 + t) * p.m_tok_stride;
+            for (uint k0 = tid; k0 < nq; k0 += 8u * NTH) {
+                uvec4 mw[8];
+                [[unroll]] for (uint j = 0; j < 8; ++j) {
+                    const uint k = min(k0 + j * NTH, nq - 1u);
+                    mw[j] = data_m4[(mrow + (span + (k >> 2) * n_spans) * KT) / 8u + (k & 3u)];
+                }
+                [[unroll]] for (uint j = 0; j < 8; ++j) {
+                    const uint k = k0 + j * NTH;
+                    if (k < nq && any(notEqual(mw[j], uvec4(0u)))) { atomicOr(mflags[k >> 7], 1u << ((k >> 2) & 31u)); }
+                    if (k < nq && any(notEqual(mw[j], uvec4(0xFC00FC00u)))) { last = max(last, (k >> 2) + 1u); }
+                }
+            }
+        }
+        last = subgroupMax(last);
+        if (lane == 0u) { atomicMax(n_live_sh, last); }
+        barrier();
+        if (nft == n_my) { n_live = max(n_live_sh, 1u); }
+    } else {
+        // 4 uvec4 (32 keys) per token per tile, fetched 4 at a time per thread with all loads in flight
+        if (tid < 8u) { mflags[tid] = 0u; }
+        barrier();
+        const uint nm = p.n_tok * min(n_my, 256u) * 4u;
+        for (uint k0 = tid; k0 < nm; k0 += 4u * NTH) {
+            uvec4 mw[4];
+            [[unroll]] for (uint j = 0; j < 4; ++j) {
+                const uint k  = min(k0 + j * NTH, nm - 1u);
+                const uint tq = k / (min(n_my, 256u) * 4u);
+                const uint rm = k % (min(n_my, 256u) * 4u);
+                mw[j] = data_m4[(tq * p.m_tok_stride + (span + (rm >> 2) * n_spans) * KT) / 8u + (rm & 3u)];
+            }
+            [[unroll]] for (uint j = 0; j < 4; ++j) {
+                const uint k  = k0 + j * NTH;
+                const uint ti = (k % (min(n_my, 256u) * 4u)) >> 2;
+                if (k < nm && any(notEqual(mw[j], uvec4(0u)))) { atomicOr(mflags[ti >> 5], 1u << (ti & 31u)); }
+            }
+        }
+        barrier();
+    }
+
+    ACC O[8];
+    [[unroll]] for (uint c = 0; c < 8; ++c) { O[c] = ACC(0.0); }
+    uint sink = 0u;          // PROF only
+    float m_run = NEG_INF;   // running max of this lane's query row, log2 units
+    float l_run = 0.0;       // running sum over this lane's keys (rows 2 e + hf)
+
+    for (uint i = 0; i < n_live; ++i) {
+        const uint key0 = (span + i * n_spans) * KT;
+
+        // ================= phase A: V(t) -> V^T plane, fetch V(t + 1); QK(t) over this subgroup's 128 dims =================
+        if (filler) {
+            if ((PROF & P_NOFILL) == 0u) { [[unroll]] for (uint u = 0; u < FU; ++u) { fill_v(rv[u], lane, FB(u)); } }
+            else { [[unroll]] for (uint u = 0; u < FU; ++u) { sink ^= rv[u].a.x ^ rv[u].b; } }
+            if (i + 1u < n_live && (PROF & P_NOFETCH) == 0u) {
+                const uint kk = min((span + (i + 1u) * n_spans) * KT + lane, p.n_kv - 1u);
+                [[unroll]] for (uint u = 0; u < FU; ++u) { rv[u] = fetch_v(kk * p.v_row_stride + g * p.v_head_stride + FB(u)); }
+            }
+        }
+
+        ACC sacc = ACC(0.0);
+        if ((PROF & P_NOQK) == 0u) {
+            [[unroll]] for (uint c = 0; c < 8; ++c) {
+                if (FRAG_BATCH != 0u && c == 4u) { subgroupMemoryBarrierShared(); }   // the first four fragments are in
+                MATA ka;
+                coopMatLoad(ka, Kpl, (16u * ks) * KROW + 32u * d + 4u * c, KROW, gl_CooperativeMatrixLayoutRowMajor);
+                sacc = coopMatMulAdd(ka, qf[c], sacc);
+            }
+        }
+        if ((PROF & P_NOSX) == 0u) {
+            Sx[w * 64u + 2u * lane]      = vec4(sacc[0], sacc[1], sacc[2], sacc[3]);
+            Sx[w * 64u + 2u * lane + 1u] = vec4(sacc[4], sacc[5], sacc[6], sacc[7]);
+        }
+        if ((PROF & P_NOBAR) == 0u) { barrier(); }
+
+        // ================= phase B: K(t + 1) -> K plane, fetch K(t + 2); full S^T; softmax; PV(t) =================
+        if (filler && i + 1u < n_live) {
+            if ((PROF & P_NOFILL) == 0u) { [[unroll]] for (uint u = 0; u < FU; ++u) { fill_k(rk[u], lane, FB(u)); } }
+            else { [[unroll]] for (uint u = 0; u < FU; ++u) { sink ^= rk[u].a.y ^ rk[u].odd; } }
+            if (i + 2u < n_live && (PROF & P_NOFETCH) == 0u) {
+                const uint kk = min((span + (i + 2u) * n_spans) * KT + lane, p.n_kv - 1u);
+                [[unroll]] for (uint u = 0; u < FU; ++u) { rk[u] = fetch_k(kk * p.k_row_stride + g * p.k_head_stride + FB(u)); }
+            }
+        }
+        if ((PROF & P_NOSX) == 0u) {
+            const vec4 a = Sx[(w ^ 1u) * 64u + 2u * lane];
+            const vec4 b = Sx[(w ^ 1u) * 64u + 2u * lane + 1u];
+            sacc[0] += a.x; sacc[1] += a.y; sacc[2] += a.z; sacc[3] += a.w;
+            sacc[4] += b.x; sacc[5] += b.y; sacc[6] += b.z; sacc[7] += b.w;
+        }
+        float sv[8];
+        float mx = NEG_INF;
+        if ((PROF & P_NOSM) != 0u) {
+            [[unroll]] for (uint e = 0; e < 8; ++e) { sv[e] = NEG_INF; sink ^= floatBitsToUint(sacc[e]); }
+            sink ^= mm0.x ^ mm1.w;
+        } else if (MF ? ((i >= 32u * MFW || (mflags[i >> 5] & (1u << (i & 31u))) != 0u) ? false : true)
+                      : (MASK_FAST != 0u && subgroupAll(all(equal(mm0 | mm1, uvec4(0u)))))) {
+            [[unroll]] for (uint e = 0; e < 8; ++e) {
+                const uint kk = key0 + 16u * ks + 2u * e + hf;
+                float s = sacc[e] * scale_log2;
+                s = (qok && kk < p.n_kv) ? s : NEG_INF;
+                sv[e] = s;
+                mx = max(mx, s);
+            }
+        } else {
+            if (MF) {   // a marked tile (or one past the 32 MFW that have flags): its mask, fetched now
+                const uint mrow = (tok * p.m_tok_stride + key0 + 16u * ks) / 8u;
+                mm0 = data_m4[mrow];
+                mm1 = data_m4[mrow + 1u];
+            }
+            [[unroll]] for (uint e = 0; e < 8; ++e) {
+                const uint  kk = key0 + 16u * ks + 2u * e + hf;
+                const uvec4 mq = (e < 4u) ? mm0 : mm1;
+                const vec2  mv = unpackHalf2x16(mq[e & 3u]);
+                float s = sacc[e] * scale_log2 + ((hf == 0u) ? mv.x : mv.y) * LOG2E;
+                // a masked key (mask = -inf) also lands at -inf through the add; keys past n_kv and padding rows are set to it
+                s = (qok && kk < p.n_kv) ? s : NEG_INF;
+                sv[e] = s;
+                mx = max(mx, s);
+            }
+        }
+        mx = max(mx, subgroupShuffleXor(mx, 16u));   // the other 8 keys of this query row
+        if ((PROF & P_NOSM) == 0u && subgroupAny(mx > m_run + THRESH)) {
+            const float mn = max(m_run, mx);
+            const float alpha = (m_run == NEG_INF) ? 0.0 : exp2(m_run - mn);
+            m_run = mn;
+            l_run *= alpha;
+            [[unroll]] for (uint c = 0; c < 8; ++c) {
+                [[unroll]] for (uint e = 0; e < 8; ++e) { O[c][e] *= alpha; }
+            }
+        }
+        float psum = 0.0;
+        if ((PROF & P_NOSM) == 0u) {
+            [[unroll]] for (uint e = 0; e < 8; ++e) {
+                const float pe = (m_run == NEG_INF) ? 0.0 : exp2(sv[e] - m_run);   // exp2(-inf) = 0 for masked keys
+                psum += pe;
+                sacc[e] = pe;
+            }
+        } else {
+            [[unroll]] for (uint e = 0; e < 8; ++e) { sacc[e] = 0.0; }
+        }
+        l_run += psum;
+        // the next tile's mask, now that this one is used
+        if (!MF && i + 1u < n_live && (PROF & P_NOMASK) == 0u) {
+            const uint mrow = (tok * p.m_tok_stride + (span + (i + 1u) * n_spans) * KT + 16u * ks) / 8u;
+            mm0 = data_m4[mrow];
+            mm1 = data_m4[mrow + 1u];
+        }
+
+        // P^T as the B operand: element k of lane l is key k of query l % 16; this lane has keys 2 e + hf, lane l ^ 16
+        // the others
+        MATB pf;
+        if (PT_REG != 0u) {
+            [[unroll]] for (uint e = 0; e < 8; ++e) {
+                const float16_t own = float16_t(sacc[e]);
+                const float16_t oth = float16_t(subgroupShuffleXor(sacc[e], 16u));
+                pf[2u * e]      = (hf == 0u) ? own : oth;
+                pf[2u * e + 1u] = (hf == 0u) ? oth : own;
+            }
+        } else {
+            const ACC16 ph = ACC16(sacc);
+            coopMatStore(ph, Pst, w * (16u * PSTR), PSTR, gl_CooperativeMatrixLayoutColumnMajor);
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            coopMatLoad(pf, Pst, w * (16u * PSTR), PSTR, gl_CooperativeMatrixLayoutColumnMajor);
+        }
+        if ((PROF & P_NOPV) == 0u) {
+            [[unroll]] for (uint c = 0; c < 8; ++c) {
+                if (FRAG_BATCH != 0u && c == 4u) { subgroupMemoryBarrierShared(); }
+                MATA va;
+                coopMatLoad(va, Vpl, (128u * d + 16u * c) * VROW + 8u * ks, VROW, gl_CooperativeMatrixLayoutRowMajor);
+                O[c] = coopMatMulAdd(va, pf, O[c]);
+            }
+        } else {
+            [[unroll]] for (uint e = 0; e < 16; ++e) { sink ^= uint(float16BitsToUint16(pf[e])); }
+        }
+        if ((PROF & P_NOBAR) == 0u) { barrier(); }   // the planes, Sx and Pst are rewritten in the next tile
+    }
+
+    if (PROF != 0u && sink == 0x9E3779B9u) { data_o[0] = 1.0; }   // keeps the sink's inputs alive
+
+    if (PF != 0u) {
+        // ============ prompt mode: subgroup w (ks = 0) takes over the stream of w ^ 2 (ks = 1), whose lanes hold the same
+        // rows and dims, through Sx (free after the loop's last barrier): its max and sum, then two accumulators a round ============
+        const uint wp = w ^ 2u;
+        const float l_tot = l_run + subgroupShuffleXor(l_run, 16u);
+        if (ks == 1u) { Sx[w * 64u + lane] = vec4(m_run, l_tot, 0.0, 0.0); }
+        barrier();
+        float a_own = 1.0, a_oth = 0.0, l_all = l_tot, m_all = m_run;
+        if (ks == 0u) {
+            const vec4 o = Sx[wp * 64u + lane];
+            m_all = max(m_run, o.x);
+            a_own = (m_run == NEG_INF) ? 0.0 : exp2(m_run - m_all);
+            a_oth = (o.x == NEG_INF) ? 0.0 : exp2(o.x - m_all);
+            l_all = l_tot * a_own + o.y * a_oth;
+        }
+        [[unroll]] for (uint c = 0; c < 8; c += 2) {
+            barrier();
+            if (ks == 1u) {
+                Sx[w * 64u + 2u * lane]       = vec4(O[c][0], O[c][1], O[c][2], O[c][3]);
+                Sx[w * 64u + 2u * lane + 1u]  = vec4(O[c][4], O[c][5], O[c][6], O[c][7]);
+                Sx[wp * 64u + 2u * lane]      = vec4(O[c + 1u][0], O[c + 1u][1], O[c + 1u][2], O[c + 1u][3]);
+                Sx[wp * 64u + 2u * lane + 1u] = vec4(O[c + 1u][4], O[c + 1u][5], O[c + 1u][6], O[c + 1u][7]);
+            }
+            barrier();
+            if (ks == 0u) {
+                const vec4 x0 = Sx[wp * 64u + 2u * lane], x1 = Sx[wp * 64u + 2u * lane + 1u];
+                const vec4 y0 = Sx[w * 64u + 2u * lane],  y1 = Sx[w * 64u + 2u * lane + 1u];
+                [[unroll]] for (uint e = 0; e < 4; ++e) {
+                    O[c][e]           = O[c][e] * a_own + x0[e] * a_oth;
+                    O[c][4u + e]      = O[c][4u + e] * a_own + x1[e] * a_oth;
+                    O[c + 1u][e]      = O[c + 1u][e] * a_own + y0[e] * a_oth;
+                    O[c + 1u][4u + e] = O[c + 1u][4u + e] * a_own + y1[e] * a_oth;
+                }
+            }
+        }
+        if (ks == 0u && qok) {
+            // element e of tile c is dim 16 c + 4 (e >> 1) + 2 hf + (e & 1) of this dim half (see below)
+            if (n_spans == 1u) {   // normalized, straight to dst [D, n_head, n_tok]
+                const float inv = (l_all > 0.0) ? 1.0 / l_all : 0.0;
+                const uint obase = D * (p.n_head * tok + head) + 128u * d + 2u * hf;
+                [[unroll]] for (uint c = 0; c < 8; ++c) {
+                    [[unroll]] for (uint e = 0; e < 8; ++e) { data_o[obase + 16u * c + 4u * (e >> 1) + (e & 1u)] = O[c][e] * inv; }
+                }
+            } else {               // split-K partial span of n_spans: O unnormalized, L, M in natural log
+                const uint obase = D * p.n_head * (span + n_spans * tok) + D * head + 128u * d + 2u * hf;
+                [[unroll]] for (uint c = 0; c < 8; ++c) {
+                    [[unroll]] for (uint e = 0; e < 8; ++e) { data_o[obase + 16u * c + 4u * (e >> 1) + (e & 1u)] = O[c][e]; }
+                }
+                if (d == 0u && hf == 0u) {
+                    const uint lm = D * p.n_head * p.n_tok * n_spans + p.n_head * 2u * (span + n_spans * tok) + head;
+                    data_o[lm] = l_all;
+                    data_o[lm + p.n_head] = (m_all == NEG_INF) ? NEG_INF : m_all * LN2;
+                }
+            }
+        }
+        return;
+    }
+
+    // ================= this key-half stream's split-K partial: span 2 span + ks =================
+    const float l_tot = l_run + subgroupShuffleXor(l_run, 16u);
+    const uint nse = 2u * n_spans;
+    const uint sp  = 2u * span + ks;
+    if (qok) {
+        // element e of tile c is slot 16 c + 2 e + hf, i.e. dim 16 c + 4 (e >> 1) + 2 hf + (e & 1)
+        const uint obase = D * p.n_head * (sp + nse * tok) + D * head + 128u * d + 2u * hf;
+        [[unroll]] for (uint c = 0; c < 8; ++c) {
+            [[unroll]] for (uint e = 0; e < 8; ++e) { data_o[obase + 16u * c + 4u * (e >> 1) + (e & 1u)] = O[c][e]; }
+        }
+        if (d == 0u && hf == 0u) {
+            const uint lm = D * p.n_head * p.n_tok * nse + p.n_head * 2u * (sp + nse * tok) + head;
+            data_o[lm] = l_tot;
+            data_o[lm + p.n_head] = (m_run == NEG_INF) ? NEG_INF : m_run * LN2;
+        }
+    }
+}

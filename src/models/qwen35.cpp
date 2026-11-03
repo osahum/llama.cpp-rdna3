@@ -387,6 +387,18 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
 
+    // llama-rdna: add the four input projections and the gate math to the graph here, in this order, so a backend sees
+    // them side by side; otherwise z first appears at the output gate and alpha/beta after the conv chain, which costs
+    // the Vulkan backend about three barrier levels per layer. Node order only: the computation is unchanged.
+    // LLAMA_GDN_LATE_PROJ=1 restores the old order.
+    static const bool late_proj = getenv("LLAMA_GDN_LATE_PROJ") != nullptr;
+    if (!late_proj) {
+        ggml_build_forward_expand(gf, qkv_mixed);
+        ggml_build_forward_expand(gf, z);
+        ggml_build_forward_expand(gf, beta);
+        ggml_build_forward_expand(gf, gate);
+    }
+
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
 
@@ -656,7 +668,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
+    cur = build_draft_head(head_w, head_s, cur);   // llama-rdna: optional prefix vocabulary (LLAMA_DRAFT_VOCAB_OUT)
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;

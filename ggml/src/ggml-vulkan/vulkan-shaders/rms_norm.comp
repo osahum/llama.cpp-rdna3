@@ -8,6 +8,15 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #endif
+// llama-rdna: RMS_NORM_Q8_FUSION also emits the normalized, scaled rows as q8_1 blocks (what the following mat-vecs
+// would quantize themselves); it needs clustered subgroup ops, so the non-subgroup build falls back to the plain path.
+#if RMS_NORM_Q8_FUSION && USE_SUBGROUP_ADD
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#define RMS_Q8 1
+#else
+#define RMS_Q8 0
+#endif
 
 layout (constant_id = 3) const int BLOCK_SIZE = 512;
 layout(local_size_x_id = 3, local_size_y = 1, local_size_z = 1) in;
@@ -45,6 +54,17 @@ layout (binding = 4) readonly buffer E {float data_e[];};
 #elif RMS_NORM_SET_ROWS_FUSION
 
 layout (binding = 3) readonly buffer I {uvec2 data_i[];};
+
+#elif RMS_NORM_MUL_MUL_FUSION
+
+// llama-rdna: rms_norm(x) * w * e, e a tensor laid out like dst (the GDN output gate silu(z)); the second multiply of
+// the separate MUL op, same order
+layout (binding = 3) readonly buffer E {float data_e[];};
+
+#elif RMS_NORM_Q8_FUSION
+
+// block_q8_1_x4 layout, written exactly as quantize_q8_1_x4 writes it (one block per 32 columns)
+layout (binding = 3) writeonly buffer Q8 {block_q8_1_x4 data_q8[];};
 
 #endif
 
@@ -130,12 +150,51 @@ void rms_norm(uint num_iters) {
             const FLOAT_TYPE scale = inversesqrt(mean + FLOAT_TYPE(p.param1));
 
             if (do_multiply) {
+#if RMS_Q8
+                // Columns are assigned by subgroup coordinates so the 32 lanes of a cluster hold 32 consecutive columns
+                // (full subgroups; BLOCK_SIZE and ncols are multiples of 32). Each lane writes its f32 value and the
+                // cluster quantizes one q8_1 block like quantize_q8_1.comp: d = amax / 127, q = round(v / d), ds = (d, sum(q) * d).
+                const uint qtid = gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID;
+                const uint q8_base = ((samp*nchannels + channel)*nrows + row)*ncols;
+                [[unroll]] for (uint col = qtid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
+                    FLOAT_TYPE value = FLOAT_TYPE(0);
+                    if (col < ncols) {
+                        const uint bcol = (ncols > p.ne10) ? fastmod(col, p.ne10) : col;
+                        value = scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + bcol]);
+                        data_d[d_offset + col] = D_TYPE(value);
+                    }
+                    const float v = float(value);
+                    const float amax = subgroupClusteredMax(abs(v), 32);
+                    const float d = amax / 127.0;
+                    const float d_inv = d != 0.0 ? 1.0 / d : 0.0;
+                    const float q = round(v * d_inv);
+                    const float qsum = subgroupClusteredAdd(q, 32);
+                    // lanes 4j gather their three neighbours (same 32-lane cluster, so the ids stay in range)
+                    const float q1 = subgroupShuffle(q, gl_SubgroupInvocationID + 1);
+                    const float q2 = subgroupShuffle(q, gl_SubgroupInvocationID + 2);
+                    const float q3 = subgroupShuffle(q, gl_SubgroupInvocationID + 3);
+                    if (col < ncols) {
+                        const uint e = q8_base + col;
+                        const uint ib = e / 32;
+                        const uint il = e % 32;
+                        if ((il & 3) == 0) {
+                            data_q8[ib / 4].qs[(ib % 4) * 8 + il / 4] = pack32(i8vec4(ivec4(int(q), int(q1), int(q2), int(q3))));
+                        }
+                        if (il == 0) {
+                            data_q8[ib / 4].ds[ib % 4] = f16vec2(vec2(d, qsum * d));
+                        }
+                    }
+                }
+#else
                 if (ncols > p.ne10) {
                     [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
                         if (col >= ncols) {
                             continue;
                         }
                         FLOAT_TYPE value = scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + fastmod(col, p.ne10)]);
+#if RMS_NORM_MUL_MUL_FUSION
+                        value *= FLOAT_TYPE(data_e[d_offset + col]);
+#endif
 #if RMS_NORM_ADD_FUSION
                         value += FLOAT_TYPE(data_c[d_offset + col]);
                         if (do_post_multiply) {
@@ -150,6 +209,9 @@ void rms_norm(uint num_iters) {
                             continue;
                         }
                         FLOAT_TYPE value = scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + col]);
+#if RMS_NORM_MUL_MUL_FUSION
+                        value *= FLOAT_TYPE(data_e[d_offset + col]);
+#endif
 #if RMS_NORM_ADD_FUSION
                         value += FLOAT_TYPE(data_c[d_offset + col]);
                         if (do_post_multiply) {
@@ -159,12 +221,19 @@ void rms_norm(uint num_iters) {
                         data_d[d_offset + col] = D_TYPE(value);
                     }
                 }
+#endif
             } else {
                 [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
                     if (col >= ncols) {
                         continue;
                     }
-                    data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]));
+                    FLOAT_TYPE value = scale * FLOAT_TYPE(data_a[a_offset + col]);
+                    // llama-rdna: RMS_NORM_SCALE fusion, param2 = the following SCALE's factor (0 = none); the same
+                    // second multiply the separate SCALE op would do
+                    if (p.param2 != 0.0f) {
+                        value *= FLOAT_TYPE(p.param2);
+                    }
+                    data_d[d_offset + col] = D_TYPE(value);
                 }
             }
 #if RMS_NORM_ROPE_FUSION

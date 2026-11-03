@@ -208,6 +208,24 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
         }
 #endif // defined(GGML_USE_HIP)
     } else {
+#if defined(GGML_USE_HIP)
+        // llama-rdna: on ROCm, hipMalloc does not fail when VRAM is full. The amdgpu driver evicts other buffers to
+        // GTT (system RAM) instead, which on the test machine cascaded into 15.7 GiB of pinned host memory and froze the
+        // host twice (hip-1, 2026-11-01). Refuse allocations that do not fit into free VRAM minus a margin so that
+        // llama-server fails to start instead. GGML_HIP_VRAM_GUARD=0 disables, GGML_HIP_VRAM_MARGIN_MB sets the margin.
+        static const bool   guard     = !(getenv("GGML_HIP_VRAM_GUARD") && atoi(getenv("GGML_HIP_VRAM_GUARD")) == 0);
+        static const size_t margin    = (size_t) (getenv("GGML_HIP_VRAM_MARGIN_MB") ? atoll(getenv("GGML_HIP_VRAM_MARGIN_MB")) : 384) * 1024 * 1024;
+        if (guard) {
+            size_t free_mem = 0, total_mem = 0;
+            if (cudaMemGetInfo(&free_mem, &total_mem) == cudaSuccess && size + margin > free_mem) {
+                GGML_LOG_ERROR("%s: refusing to allocate %.2f MiB on device %d: only %.2f MiB of VRAM free (margin %.0f MiB); "
+                               "set GGML_HIP_VRAM_GUARD=0 to allow the driver to spill into GTT\n",
+                               __func__, size/1024.0/1024.0, device, free_mem/1024.0/1024.0, margin/1024.0/1024.0);
+                (void) cudaGetLastError();
+                return cudaErrorMemoryAllocation;
+            }
+        }
+#endif // defined(GGML_USE_HIP)
         err = cudaMalloc(ptr, size);
     }
     return err;
@@ -496,9 +514,11 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 #endif
         size_t best_diff = 1ull << 36;
         int ibest = -1;
+        size_t cached_bytes_total = 0;
         for (int i = 0; i < MAX_BUFFERS; ++i) {
             ggml_cuda_buffer& b = buffer_pool[i];
             if (b.ptr != nullptr) {
+                cached_bytes_total += b.size;
 #ifdef DEBUG_CUDA_MALLOC
                 ++nnz;
                 if (b.size > max_size) max_size = b.size;
@@ -531,6 +551,36 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         size_t look_ahead_size = (size_t) (1.05 * size);
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
         ggml_cuda_set_device(device);
+        // llama-rdna: a request that no cached buffer can serve, while the cache already holds a lot, is the signature of
+        // a scratch allocation that grows with the context (5% look-ahead per step keeps every previous size cached:
+        // a geometric series worth ~20x the final size). On ROCm an oversubscribed device does not fail cudaMalloc, it
+        // evicts to GTT and host RAM, so the OOM path below never runs. Release the cached buffers that are too small
+        // for this request once the cache exceeds GGML_CUDA_POOL_CACHE_MAX_MB (default 512).
+        {
+            static const size_t cache_max = [] {
+                const char * env = getenv("GGML_CUDA_POOL_CACHE_MAX_MB");
+                return (size_t) (env ? atoll(env) : 512) * 1024 * 1024;
+            }();
+            if (cached_bytes_total > cache_max) {
+                CUDA_CHECK(cudaDeviceSynchronize());
+                size_t freed = 0;
+                for (int i = 0; i < MAX_BUFFERS; ++i) {
+                    ggml_cuda_buffer & b = buffer_pool[i];
+                    if (b.ptr != nullptr && b.size < size) {
+                        CUDA_CHECK(cudaFree(b.ptr));
+                        pool_size -= b.size;
+                        freed += b.size;
+                        b.ptr  = nullptr;
+                        b.size = 0;
+                    }
+                }
+                if (freed > 0) {
+                    GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: released %.2f MiB of cached buffers smaller than a %.2f MiB request\n",
+                                   device, freed/1024.0/1024.0, size/1024.0/1024.0);
+                    invalidate_cuda_graphs();
+                }
+            }
+        }
         cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
         if (err == cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();
@@ -4750,6 +4800,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+static __global__ void k_perf_stamp(uint64_t * dst) {
+#if defined(GGML_USE_HIP)
+    *dst = wall_clock64();
+#elif defined(GGML_USE_MUSA)
+    *dst = (uint64_t) clock64();
+#else
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    *dst = t;
+#endif
+}
+
+void ggml_cuda_perf_stamp(uint64_t * dst, cudaStream_t stream) {
+    k_perf_stamp<<<1, 1, 0, stream>>>(dst);
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4906,6 +4972,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                ggml_cuda_perf_logger & perf = cuda_ctx->perf_logger;
+                if (perf.enabled) {
+                    perf.begin_node(cuda_ctx->device, cgraph, i, cuda_ctx->stream());
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -4915,6 +4986,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
+                    if (perf.enabled) {
+                        perf.end_node(cgraph, i, nodes_to_skip + 1, cuda_ctx->stream());
+                    }
                     i += nodes_to_skip;
                     continue;
                 }
@@ -4940,6 +5014,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                if (perf.enabled) {
+                    perf.end_node(cgraph, i, 1, cuda_ctx->stream());
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -4976,6 +5054,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
 #endif  // USE_CUDA_GRAPH
+    }
+
+    if (cuda_ctx->perf_logger.enabled && !cuda_ctx->perf_logger.recs.empty()) {
+        cuda_ctx->perf_logger.end_graph(cuda_ctx->stream());
     }
 }
 

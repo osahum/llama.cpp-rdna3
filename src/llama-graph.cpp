@@ -266,6 +266,21 @@ void llm_graph_input_pos_bucket_kv::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_vocab_tail::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    GGML_ASSERT(mask);
+    std::vector<float> data(n_vocab, 0.0f);
+    for (uint32_t i = n_keep; i < n_vocab; ++i) {
+        data[i] = -INFINITY;
+    }
+    ggml_backend_tensor_set(mask, data.data(), 0, data.size()*sizeof(float));
+}
+
+bool llm_graph_input_vocab_tail::can_reuse(const llm_graph_params & params) {
+    GGML_UNUSED(params);
+    return true; // the mask depends only on the model and n_keep, both fixed for the context
+}
+
 void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(out_ids);
 
@@ -2767,6 +2782,32 @@ ggml_tensor * llm_graph_context::build_inp_attn_scale() const {
     res->add_input(std::move(inp));
 
     return cur;
+}
+
+ggml_tensor * llm_graph_context::build_draft_head(ggml_tensor * head_w, ggml_tensor * head_s, ggml_tensor * cur) const {
+    static const uint32_t n_keep_env = getenv("LLAMA_DRAFT_VOCAB_OUT") ? (uint32_t) std::max(0, atoi(getenv("LLAMA_DRAFT_VOCAB_OUT"))) : 0u;
+    const uint32_t n_vocab = (uint32_t) head_w->ne[1];
+    const uint32_t n_keep  = n_keep_env;
+    if (n_keep == 0 || n_keep >= n_vocab || n_keep % 256 != 0 || !ggml_is_contiguous(head_w)) {
+        return build_lora_mm(head_w, cur, head_s);
+    }
+    // first n_keep rows of the head: a contiguous prefix of the weight tensor
+    ggml_tensor * head_view = ggml_view_2d(ctx0, head_w, head_w->ne[0], n_keep, head_w->nb[1], 0);
+    cb(head_view, "draft_head_view", -1);
+    ggml_tensor * logits = ggml_mul_mat(ctx0, head_view, cur);
+    if (head_s) {
+        logits = ggml_mul(ctx0, logits, ggml_view_1d(ctx0, head_s, n_keep, 0));
+    }
+    cb(logits, "draft_logits_prefix", -1);
+    // pad to the full vocabulary with -inf: zeros from ggml_pad plus an additive mask input
+    logits = ggml_pad(ctx0, logits, (int) (n_vocab - n_keep), 0, 0, 0);
+    auto inp = std::make_unique<llm_graph_input_vocab_tail>(n_vocab, n_keep);
+    inp->mask = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_vocab);
+    ggml_set_input(inp->mask);
+    ggml_set_name(inp->mask, "draft_vocab_tail");
+    logits = ggml_add(ctx0, logits, inp->mask);
+    res->add_input(std::move(inp));
+    return logits;
 }
 
 ggml_tensor * llm_graph_context::build_inp_out_ids() const {

@@ -81,6 +81,24 @@ struct vk_mat_vec_id_push_constants {
     uint32_t nbi1;
 };
 
+// llama-rdna: flash_attn_dec.comp (small-batch attention over q4_0/q8_0/f16 KV, head 256)
+struct vk_fa_dec_push_constants {
+    uint32_t n_tok;
+    uint32_t n_head;
+    uint32_t gqa;
+    uint32_t n_kv;
+    uint32_t n_spans;
+    uint32_t q_tok_stride;   // floats
+    uint32_t q_head_stride;  // floats
+    uint32_t k_row_stride;   // blocks (quant) or f16vec4 (f16)
+    uint32_t k_head_stride;
+    uint32_t v_row_stride;
+    uint32_t v_head_stride;
+    uint32_t m_tok_stride;   // halfs
+    float    scale;
+    uint32_t tok_blk;        // tokens per workgroup along z (flash_attn_dec_cm.comp prefill blocks); n_tok otherwise
+};
+
 struct vk_flash_attn_push_constants {
     uint32_t N;
     uint32_t KV;
@@ -705,6 +723,8 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+    uint32_t cache_slot_stride; // GDN_CACHE_CPY fusion: per-slot stride of the cache view in floats (0 when not fused or K == 1)
+    uint32_t fused;             // 1 when the snapshots go to the cache binding instead of the gdn_out tail
 };
 
 struct vk_op_ssm_scan_push_constants {

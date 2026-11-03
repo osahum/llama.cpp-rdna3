@@ -2376,6 +2376,30 @@ int llama_bench(int argc, char ** argv) {
         }
 
         llama_context * ctx = llama_init_from_model(lmodel, cparams);
+        // llama-rdna: LLAMA_BENCH_LOAD_ONLY=1 stops after model + context creation (memory accounting without a prefill)
+        if (ctx != NULL && getenv("LLAMA_BENCH_LOAD_ONLY") != NULL) {
+            llama_synchronize(ctx);
+            // device memory as the kernel sees it (amdgpu sysfs), after model, KV cache and compute buffers exist
+            for (const char * card : { "card0", "card1", "card2" }) {
+                for (const char * what : { "mem_info_vram_used", "mem_info_gtt_used" }) {
+                    char path[128];
+                    snprintf(path, sizeof(path), "/sys/class/drm/%s/device/%s", card, what);
+                    FILE * f = fopen(path, "r");
+                    if (f) {
+                        long long v = 0;
+                        if (fscanf(f, "%lld", &v) == 1) {
+                            fprintf(stderr, "llama-bench: %s %s = %lld MiB\n", card, what, v / (1024 * 1024));
+                        }
+                        fclose(f);
+                    }
+                }
+            }
+            fprintf(stderr, "llama-bench: LLAMA_BENCH_LOAD_ONLY set, context created (n_ctx=%u, n_batch=%u, n_ubatch=%u), exiting\n",
+                    llama_n_ctx(ctx), llama_n_batch(ctx), llama_n_ubatch(ctx));
+            llama_free(ctx);
+            llama_model_free(lmodel);
+            return 0;
+        }
         if (ctx == NULL) {
             fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());
             llama_model_free(lmodel);
